@@ -1,0 +1,68 @@
+[
+  {
+    "t": "15/11 22:09",
+    "name": "Sincronización (auto, Ambos)",
+    "dur": "32s",
+    "code": 1
+  },
+  {
+    "t": "16/11 16:47",
+    "name": "Sincronización (auto, Ambos)",
+    "dur": "296m 55s",
+    "code": 0
+  },
+  {
+    "t": "16/11 21:59",
+    "name": "Descarga de imágenes (Ambos)",
+    "dur": "119m 58s",
+    "code": 1
+  },
+  {
+    "t": "16/11 23:51",
+    "name": "Descarga de imágenes (Ambos)",
+    "dur": "108m 27s",
+    "code": 1
+  },
+  {
+    "t": "17/11 22:59",
+    "name": "Descarga de imágenes (Ambos)",
+    "dur": "64m 11s",
+    "code": 1
+  },
+  {
+    "t": "18/11 21:35",
+    "name": "Sincronización (auto, VerMangasPorno)",
+    "dur": "133m 27s",
+    "code": 1
+  },
+  {
+    "t": "19/11 21:02",
+    "name": "Sincronización (auto, Pawchive)",
+    "dur": "1s",
+    "code": 0
+  },
+  {
+    "t": "20/11 22:08",
+    "name": "Sincronización (auto, Pawchive)",
+    "dur": "1s",
+    "code": 0
+  },
+  {
+    "t": "20/11 23:09",
+    "name": "Descarga (imagen,video,archivo) (Pawchive)",
+    "dur": "1s",
+    "code": 0
+  },
+  {
+    "t": "20/11 23:11",
+    "name": "Descarga (imagen,video,archivo) (Pawchive)",
+    "dur": "36s",
+    "code": 1
+  },
+  {
+    "t": "20/11 23:18",
+    "name": "Descarga (imagen,video,archivo) (Pawchive)",
+    "dur": "3m 33s",
+    "code": 0
+  }
+]

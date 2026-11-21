@@ -1,0 +1,6 @@
+playwright
+mysql-connector-python
+curl_cffi
+browser-cookie3
+pycryptodomex
+beautifulsoup4
