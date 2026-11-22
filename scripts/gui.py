@@ -2083,10 +2083,10 @@ class SiteWindow(ctk.CTkToplevel):
         else:
             self._pch_acum[pid] = self._pch_posts[idx]
         self._pch_sel_posts()
-        # Después de cambiar la selección, ajustar la imagen al tamaño
-        # actual de la tarjeta (por si la ventana se redimensionó o la
-        # tarjeta cambió de ancho por cualquier motivo).
-        self._pch_post_ajustar_imagen(idx)
+        # Ya no llamamos automáticamente a _pch_post_ajustar_imagen aquí:
+        # el evento <Configure> del label ya se encarga de recortar la imagen
+        # al tamaño real cuando la ventana cambia de tamaño. La selección
+        # (marcar/desmarcar) solo afecta el borde/color, no necesita reajustar.
 
     def _pch_post_style(self, idx):
         """Pinta el estilo de la tarjeta según esté seleccionada o no."""
