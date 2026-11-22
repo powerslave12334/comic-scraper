@@ -2083,6 +2083,10 @@ class SiteWindow(ctk.CTkToplevel):
         else:
             self._pch_acum[pid] = self._pch_posts[idx]
         self._pch_sel_posts()
+        # Después de cambiar la selección, ajustar la imagen al tamaño
+        # actual de la tarjeta (por si la ventana se redimensionó o la
+        # tarjeta cambió de ancho por cualquier motivo).
+        self._pch_post_ajustar_imagen(idx)
 
     def _pch_post_style(self, idx):
         """Pinta el estilo de la tarjeta según esté seleccionada o no."""
@@ -2182,25 +2186,26 @@ class SiteWindow(ctk.CTkToplevel):
 
         - Creadores: se ajustan en un cuadrado con fondo (el avatar se ve
           completo).
-        - Posts: se guardan como cuadrado SIN fondo (recorte de la portada);
-          el ajuste al ancho real de la tarjeta se hace al pintarla, para
-          que la imagen llene la tarjeta sin deformarse.
+        - Posts: **no se fuerza cuadrado**. Se thumbnailean al ancho `w`
+          manteniendo la relación de aspecto original. El recorte al tamaño
+          exacto de la tarjeta se hace al pintar (_pch_post_ajustar_imagen),
+          así la imagen Llena la tarjeta sin deformarse.
         """
         from PIL import Image, ImageOps   # PIL es dependencia del proyecto
         datos = pawchive_api.fetch_thumb(url, timeout=30)
         img = Image.open(io.BytesIO(datos)).convert("RGB")
         img = ImageOps.exif_transpose(img) or img
-        if clave.startswith("post:"):
-            lado = max(w, h) * 2
-            img = ImageOps.fit(img, (lado, lado), method=Image.LANCZOS,
-                               centering=(0.5, 0.3))
-        else:
+        if clave.startswith("creator:"):
             img.thumbnail((w, h))
             fondo = Image.new("RGB", (w, h), (26, 26, 26))
             x = (w - img.width) // 2
             y = (h - img.height) // 2
             fondo.paste(img, (x, y))
             img = fondo
+        # Para posts: thumbnail simple, sin fondo cuadrado.
+        # El ajuste al rectángulo de la tarjeta se hará al pintar.
+        else:
+            img.thumbnail((w, h))
         buf = io.BytesIO()
         img.save(buf, "PNG")
         png = buf.getvalue()

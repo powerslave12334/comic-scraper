@@ -372,10 +372,10 @@ def fetch_thumb(url: str, timeout: int = 45) -> bytes:
 def thumb_path(clave: str) -> Path:
     """Ruta del archivo caché de una miniatura (nombre seguro).
 
-    Las claves de posts llevan versión ("p2") porque su formato cambió:
-    antes se guardaban sobre un fondo gris (con bandas) y ahora se guarda
-    el recorte cuadrado de la portada, que luego se recorta al tamaño de
-    la tarjeta al pintarla."""
-    pre = "p2:" if clave.startswith("post:") else ""
+    Las claves de posts guardan la imagen con su forma original (sinforzar
+    cuadrado). La versión "p2:" se usaba en versiones anteriores; ahora se
+    omite para que el recorte se haga al pintar, adaptándose al ancho de
+    la tarjeta y evitando deformaciones."""
+    pre = "" # versión actual: la imagen conserva su forma original
     seguro = hashlib.sha1((pre + clave).encode("utf-8")).hexdigest()
     return THUMB_DIR / f"{seguro}.png"
