@@ -264,14 +264,22 @@ Pestaña con **dos paneles**; todo va por la API JSON de `pawchive_api.py`
     existe, y la carga se hace **en un hilo aparte**: la ventana no se
     congela). Se pintan como mucho **1.500 artistas** (`PCH_IDX_MAX`),
     ordenados por popularidad (`favorited` ↓).
-  - **Grid de tarjetas (4 columnas)**: cada artista es una tarjeta de
-    180×220 px con su **avatar** y un **overlay negro** dentro con el
-    **nombre** (en negrita) y la línea **`servicio · id`**. El grid está
-    **virtualizado**: del índice completo solo se crean las tarjetas que
-    caben en el viewport (24 de 99.348 con el índice completo), al hacer
-    scroll se recrean las que entran en pantalla y el `scrollregion` mantiene
-    la altura real del índice. La **selección sobrevive al reciclado** (se
-    guarda por índice, no por widget).
+  - **Grid de tarjetas (3×3) paginado**: cada artista es una tarjeta de
+    170×210 px con su **avatar** y una banda de información dentro con el
+    **nombre** (en negrita) y la línea **`servicio · id`**. Se muestran
+    **9 artistas por página** (`PCH_ART_POR_PAGINA`): la barra de paginación
+    tiene **‹ Anterior**, **Página X de Y** y **Siguiente ›**, más un campo
+    para saltar a una página concreta (con 1.500 artistas son 167 páginas).
+    Solo se crean 9 tarjetas a la vez, así que la ventana responde al
+    instante. La **selección sobrevive al cambio de página** (se guarda por
+    índice, no por widget) y al filtrar se vuelve a la página 1.
+  - **Miniaturas**: el avatar se descarga en un hilo aparte y se guarda en
+    `scripts/pawchive_thumbs/` (caché en disco): la segunda vez se pinta
+    **sin tocar la red**. El `PhotoImage` se crea **siempre en el hilo
+    principal** de Tk (crearlo desde un hilo es ilegal y Tk lo rechaza en
+    silencio: por eso antes no se veía ninguna miniatura). Si una imagen
+    falla, la tarjeta muestra la inicial del artista y el error queda en el
+    registro.
   - **Filtros**: búsqueda por **nombre o id** (debounce de 300 ms),
     desplegable de **servicio** (Todos / Patreon / Fanbox / Discord) y
     casilla **★ Solo mis creadores**.
@@ -328,8 +336,8 @@ instante y la interfaz no se quede quieta:
   → `<Configure>` → otro `_draw` (era la causa del congelón final de ~2,5 s).
 - El **índice de artistas** (4,1 MB) se lee y deserializa **en un hilo
   aparte**; la GUI solo consume la lista ya en memoria.
-- El **grid de artistas** está virtualizado: solo se crean las tarjetas
-  visibles (24 de 99.348), así que no hay 99.348 widgets que crear.
+- El **grid de artistas** está paginado: solo se crean **9 tarjetas** (3×3)
+  a la vez, así que no hay 99.348 widgets que crear ni scroll infinito.
 
 Medido en este equipo con el **mainloop real** (la misma forma en que se
 mide la respuesta de la app; con un `update()` en bucle los números salen

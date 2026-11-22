@@ -18,14 +18,30 @@
   → `<Configure>` → otro `_draw` (recursión que congelaba 2,5 s al final).
 - Congelón máximo medido (mainloop real): **180-370 ms** (antes 910 ms y 2,5 s).
 
-### Grid de artistas virtualizado (pestaña 🐾 Explorar)
+### Grid de artistas paginado (pestaña 🐾 Explorar)
 
-- Grid de **4 columnas** con tarjetas 180×220: avatar + overlay negro con
+- Grid de **3×3 = 9 tarjetas por página** (180×220): avatar + banda con el
   **nombre** y **`servicio · id`**.
-- Solo se crean las tarjetas **visibles** (24 de 99.348) y el `scrollregion`
-  mantiene la altura real del índice.
-- La **selección sobrevive al reciclado** (se guarda por índice).
-- El índice (4,1 MB) se carga en **hilo aparte**.
+- Barra de paginación: **‹ Anterior**, **Página X de Y**, **Siguiente ›** y
+  salto directo a una página (1.500 artistas = 167 páginas).
+- Solo se crean 9 tarjetas a la vez (antes: grid virtualizado con scroll
+  infinito y `scrollregion` forzado al alto total del índice).
+- La **selección sobrevive al cambio de página** (se guarda por índice) y al
+  filtrar se vuelve a la página 1.
+- El panel de artistas y el de posts se reparten con **grid** (no con
+  `pack`): el Treeview de posts ya no se come el ancho y las **3 columnas**
+  de tarjetas caben enteras (antes la 3ª quedaba cortada).
+
+### Miniaturas: por qué no se veían (y arreglo)
+
+| Causa | Detalle |
+|---|---|
+| `tk.PhotoImage` creado **fuera del hilo principal** | Tk no admite crear objetos desde otro hilo: la llamada falla y el `except Exception: pass` se la tragaba → **ninguna** miniatura se pintaba nunca |
+| `after()` llamado desde el hilo de descarga | GTK/Tk no es seguro entre hilos: ahora la imagen viaja por la **cola de mensajes** (`_pch_q`) y el `PhotoImage` se crea en el hilo principal |
+| El overlay tapaba el avatar | El overlay opaco cubría toda la tarjeta: ahora es una banda inferior y el avatar se ve |
+| Sin caché en disco | Ahora el PNG se guarda en `scripts/pawchive_thumbs/` y la segunda vez se pinta **sin red** |
+| `PhotoImage` plano en un `CTkLabel` | Aviso de customtkinter en pantallas HiDPI: las tarjetas usan ahora `CTkImage` (escala bien) |
+| Errores silenciosos | Si una miniatura falla se muestra la inicial del artista y el error queda en el registro |
 
 ### Bugs corregidos
 
@@ -49,6 +65,9 @@
 - `test_ui.py`, `test_index_gui.py`, `test_all_files.py`, `test_tags.py`,
   `test_e2e.py`, `test_sites.py`, `test_dash_layout.py`, `test_dash_scroll.py`,
   `test_pch_open.py`, `test_pch_speed.py`: OK.
+- `test_paginacion.py` (nuevo): 19/19 — 9 tarjetas por página, 3 páginas,
+  botones y salto directo, la selección sobrevive al cambio de página y la
+  **miniatura real se pinta** (red + caché en disco).
 - `test_gap.py` mide el congelón **con el mainloop real** (con un `update()`
   en bucle el número sale inflado ~10×: artefacto de la medición).
 - Estado final de la BD tras la batería: 11.157 vcp + 9.185 vmp,
