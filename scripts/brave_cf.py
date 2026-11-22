@@ -16,7 +16,6 @@ Uso:
 import ctypes
 import ctypes.wintypes
 import json
-import os
 import shutil
 import sqlite3
 import sys
@@ -32,10 +31,13 @@ except Exception:
 
 from curl_cffi import requests as creq
 
+from config import BRAVE_USER_DATA, CF_CACHE_MAX_AGE, SCRIPT_DIR
+from exceptions import CloudflareBlocked as CfBlocked
+
 # -------------- CONFIGURACIÓN --------------
+# DOMAIN y BASE_URL se mantienen como fallback; el dominio real se deriva de la URL
 DOMAIN = "vercomicsporno.com"
 BASE_URL = f"https://{DOMAIN}"
-SCRIPT_DIR = Path(__file__).resolve().parent
 CACHE_FILE = SCRIPT_DIR / "cf_cache.json"
 
 
@@ -50,25 +52,16 @@ def domain_of(url: str) -> str:
     host = urlparse(url).netloc.lower()
     return host[4:] if host.startswith("www.") else host
 
-BRAVE_USER_DATA = (Path(os.environ.get("LOCALAPPDATA", "")) /
-                   "BraveSoftware" / "Brave-Browser" / "User Data")
 
 # UA de respaldo; lo correcto es el de Brave (se deriva de su versión)
 FALLBACK_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                "(KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36")
-
-# Edad máxima de la caché (la cookie real caducará antes si Cloudflare lo decide)
-CACHE_MAX_AGE = 6 * 3600
 
 # Marcas de que Cloudflare sigue bloqueando
 CHALLENGE_MARKERS = (
     "un momento", "just a moment", "verificación de seguridad",
     "verify you are human", "cf-chl-", "_cf_chl_opt", "turnstile",
 )
-
-
-class CfBlocked(Exception):
-    """Cloudflare sigue bloqueando: hay que renovar cookies o usar el navegador."""
 
 
 # -------------- USER-AGENT DE BRAVE --------------
@@ -221,7 +214,7 @@ def load_cache(domain: str = DOMAIN) -> dict | None:
         data = json.loads(CACHE_FILE.read_text(encoding="utf-8"))
         if data.get("domain", DOMAIN) != domain:
             return None                      # caché de otro sitio
-        if time.time() - data.get("ts", 0) > CACHE_MAX_AGE:
+        if time.time() - data.get("ts", 0) > CF_CACHE_MAX_AGE:
             return None
         if not data.get("cookies"):
             return None
@@ -300,7 +293,6 @@ def fetch(url: str, timeout: int = 40, force_refresh: bool = False) -> str:
       1) Petición normal (sin tocar la BD de Brave) -> suele bastar.
       2) Si Cloudflare bloquea: leer cookies de Brave (solo si está cerrado)
          y reintentar una vez."""
-    ua = brave_ua()
     dom = domain_of(url)
     ref = {"Referer": f"{origin_of(url)}/"}   # Referer del propio sitio de la URL
 

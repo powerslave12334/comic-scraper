@@ -35,26 +35,22 @@ try:
 except Exception:
     pass
 
-import mysql.connector
-
 import brave_cf
+from config import (
+    DEST_DIR, DOWNLOAD_WORKERS, DOWNLOAD_TIMEOUT, DOWNLOAD_MAX_RETRIES,
+    JPEG_QUALITY, INVALID_CHARS,
+)
+from db import connection
+from exceptions import DestinationError
 
 # -------------- CONFIGURACIÓN --------------
-DB = {
-    "user": "root",
-    "password": "",
-    "host": "127.0.0.1",
-    "database": "mis_comics",
-}
-DEFAULT_DIR = Path("C:/Comics")   # destino por defecto
-OUT_DIR = DEFAULT_DIR             # se resuelve en main() según --dest / pregunta
-
 # Códigos --site -> nombre del sitio en la BD
-SITE_NOMBRES = {"vcp": "vercomicsporno", "vmp": "vermangasporno",
-                "pch": "pawchive"}
+SITE_NOMBRES = {"vcp": "vercomicsporno", "vmp": "vermangasporno", "pch": "pawchive"}
 
 # Caracteres no válidos en nombres de archivo de Windows
-INVALID = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+INVALID = re.compile(INVALID_CHARS)
+
+OUT_DIR = DEST_DIR  # se resuelve en main() según --dest / pregunta
 
 
 def safe_name(name: str) -> str:
@@ -112,12 +108,12 @@ def download(row, sess):
         return ("skip", file_path)
 
     ref = {"Referer": f"{brave_cf.origin_of(url_img)}/"}
-    max_retries = 5
+    max_retries = DOWNLOAD_MAX_RETRIES
     base_delay = 2.0  # segundos
 
     for attempt in range(max_retries):
         try:
-            r = sess.get(url_img, timeout=45, headers=ref)
+            r = sess.get(url_img, timeout=DOWNLOAD_TIMEOUT, headers=ref)
             if r.status_code == 200:
                 data = r.content
                 if len(data) < 1000:      # probablemente una página de error
@@ -160,18 +156,18 @@ def ask_destination(args) -> Path:
     if args.dest:
         return Path(args.dest).expanduser()
     if args.no_prompt or not sys.stdin.isatty():
-        return DEFAULT_DIR
+        return DEST_DIR
     try:
-        resp = input(f'Carpeta destino [Enter = "{DEFAULT_DIR}"]: ').strip().strip('"')
+        resp = input(f'Carpeta destino [Enter = "{DEST_DIR}"]: ').strip().strip('"')
     except EOFError:
-        return DEFAULT_DIR
-    return Path(resp).expanduser() if resp else DEFAULT_DIR
+        return DEST_DIR
+    return Path(resp).expanduser() if resp else DEST_DIR
 
 
 def main():
     global OUT_DIR
     parser = argparse.ArgumentParser(description="Descarga masiva de cómics")
-    parser.add_argument("--workers", type=int, default=5, help="Hilos de descarga")
+    parser.add_argument("--workers", type=int, default=DOWNLOAD_WORKERS, help="Hilos de descarga")
     parser.add_argument("--dest", "-d", default=None,
                         help='Carpeta destino, ej. --dest "D:\\Comics"')
     parser.add_argument("--no-prompt", action="store_true",
@@ -186,7 +182,7 @@ def main():
                              "archivo (por defecto: todos)")
     parser.add_argument("--no-optimize", action="store_true",
                         help="No optimizar (re-codificar) las imágenes nuevas")
-    parser.add_argument("--quality", type=int, default=82,
+    parser.add_argument("--quality", type=int, default=JPEG_QUALITY,
                         help="Calidad JPEG de la optimización (por defecto 82)")
     args = parser.parse_args()
 
@@ -196,13 +192,10 @@ def main():
     except OSError as e:
         print(f"[X] No se pudo crear la carpeta destino: {OUT_DIR}")
         print(f"    {e}")
-        sys.exit(1)
+        raise DestinationError(str(e)) from e
     print(f'Carpeta destino: "{OUT_DIR}"')
-    print("Motor: curl_cffi con huella TLS de Chrome "
-          "(sin navegador; Brave puede estar abierto)")
+    print("Motor: curl_cffi con huella TLS de Chrome (sin navegador; Brave puede estar abierto)")
 
-    conn = mysql.connector.connect(**DB)
-    cursor = conn.cursor(buffered=True)
     tipos = [t.strip() for t in args.types.split(",") if t.strip()]
     validos = {"imagen", "video", "archivo"}
     tipos = [t for t in tipos if t in validos] or ["imagen"]
@@ -216,12 +209,17 @@ def main():
         sql += " AND c.sitio = %s"
         params.append(SITE_NOMBRES[args.site])
     sql += " ORDER BY pag.comic_id, pag.numero"
-    cursor.execute(sql, params)
-    rows = cursor.fetchall()
+
+    rows = []
+    with connection() as conn:
+        with conn.cursor(buffered=True) as cursor:
+            cursor.execute(sql, params)
+            rows = cursor.fetchall()
+
     if args.site in SITE_NOMBRES:
         print(f"Sitio: {SITE_NOMBRES[args.site]}")
     print(f"Tipos: {','.join(tipos)}")
-    print(f"Descargando {len(rows)} paginas con {args.workers} hilos...")
+    print(f"Descargando {len(rows)} páginas con {args.workers} hilos...")
 
     stats = {"ok": 0, "skip": 0, "small": 0, "error": 0}
     lock = threading.Lock()
@@ -281,26 +279,25 @@ def main():
         meta[comic_id] = (titulo, sitio)
 
     n_ok = n_pend = 0
-    for comic_id, (titulo, sitio) in meta.items():
-        files = list_files(carpeta_comic(sitio, titulo))
-        completo = bool(files) and not (esperados[comic_id] - files)
-        if completo:
-            cursor.execute(
-                "UPDATE comics SET estado='descargado', "
-                "fecha_descarga=COALESCE(fecha_descarga, CURDATE()) "
-                "WHERE id=%s AND estado <> 'duplicado'", (comic_id,))
-            n_ok += 1
-        else:
-            cursor.execute(
-                "UPDATE comics SET estado='pendiente', fecha_descarga=NULL "
-                "WHERE id=%s AND estado <> 'duplicado'", (comic_id,))
-            n_pend += 1
-    conn.commit()
+    with connection() as conn:
+        with conn.cursor() as cursor:
+            for comic_id, (titulo, sitio) in meta.items():
+                files = list_files(carpeta_comic(sitio, titulo))
+                completo = bool(files) and not (esperados[comic_id] - files)
+                if completo:
+                    cursor.execute(
+                        "UPDATE comics SET estado='descargado', "
+                        "fecha_descarga=COALESCE(fecha_descarga, CURDATE()) "
+                        "WHERE id=%s AND estado <> 'duplicado'", (comic_id,))
+                    n_ok += 1
+                else:
+                    cursor.execute(
+                        "UPDATE comics SET estado='pendiente', fecha_descarga=NULL "
+                        "WHERE id=%s AND estado <> 'duplicado'", (comic_id,))
+                    n_pend += 1
+            conn.commit()
     print(f"Estado en BD (según disco): {n_ok} completos -> descargado | "
           f"{n_pend} incompletos -> pendiente")
-
-    cursor.close()
-    conn.close()
 
 
 if __name__ == "__main__":

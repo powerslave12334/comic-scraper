@@ -28,6 +28,7 @@ Uso:
     python gui.py
 """
 import json
+import contextlib
 import os
 import base64
 import io
@@ -50,7 +51,7 @@ import mysql.connector
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 import customtkinter as ctk
-from PIL import Image, ImageTk, ImageDraw
+from PIL import Image, ImageTk
 
 import pawchive_api
 
@@ -59,27 +60,17 @@ ASSETS_DIR = Path(__file__).resolve().parent / "assets"
 ICON_DIR = ASSETS_DIR / "icons"
 PATTERN_DIR = ASSETS_DIR / "patterns"
 
-# Constantes y auxiliares compartidos (viven en dashboard.py)
-from dashboard import (
-    BG, PANEL, CARD_BG,
-    ACCENT, ACCENT_HOVER, SUCCESS, WARN, DANGER, ORANGE,
-    TEXT, MUTED, BORDER,
-    DB, DEFAULT_DEST,
-    MODE_VALUES, ESTADO_FILTROS, SITES,
-    RE_PROGRESS,
-    carpeta_comic, load_config, update_config, fmt_num,
-    Dashboard,
+# Constantes y auxiliares compartidos (viven en config.py y dashboard.py)
+from config import (
+    SCRIPT_DIR, SITES, MODE_VALUES, ESTADO_FILTROS,
+    COLORS, SITE_ACCENTS, DEFAULT_DEST,
+    DB_CONFIG,
 )
-
-SCRIPT_DIR = Path(__file__).resolve().parent
-
-
-def _grab(win):
-    """Grab modal seguro (falla si la ventana aún no es visible)."""
-    try:
-        win.grab_set()
-    except tk.TclError:
-        pass
+from dashboard import (
+    Dashboard,
+    load_config, update_config, fmt_num,
+    carpeta_comic, RE_PROGRESS,
+)
 
 # Índice de cada columna del Treeview dentro de la fila de la BD.
 # fila = (id, titulo, estado, sitio, n_web, paginas, url_comic)
@@ -97,13 +88,21 @@ PCH_IDX_MAX = 1500          # filas máx. pintadas en la lista de artistas
 PCH_SVC_LABELS = {"Todos": "", "Patreon": "patreon",
                   "Fanbox": "fanbox", "Discord": "discord"}
 
+# Índice ya convertido y ordenado, en MEMORIA: se reutiliza entre ventanas
+# para que abrirla sea instantáneo (evita releer el JSON de 4 MB).
+_PCH_IDX_MEM: dict = {"at": None, "filas": None}
 
-# Colores de acento por sitio (para gradientes y hover)
-SITE_ACCENTS = {
-    "vcp": {"base": "#c0392b", "hover": "#e74c3c", "bg_top": "#1a0a0a", "bg_bot": "#0d0505"},
-    "vmp": {"base": "#27ae60", "hover": "#2ecc71", "bg_top": "#0a1a0a", "bg_bot": "#050d05"},
-    "pch": {"base": "#8e44ad", "hover": "#9b59b6", "bg_top": "#1a0a1a", "bg_bot": "#0d050d"},
-}
+
+def _normalizar_idx(creadores) -> list:
+    """JSON crudo del índice -> tuplas (id, nombre, servicio, fav) por fav↓."""
+    filas = []
+    for c in creadores:
+        try:
+            filas.append((str(c[0]), str(c[1]), str(c[2]), int(c[3])))
+        except Exception:
+            continue
+    filas.sort(key=lambda r: -r[3])        # más populares primero
+    return filas
 
 
 # Cache de iconos: (nombre, size, modo) -> CTkImage
@@ -124,7 +123,7 @@ def _load_icon(nombre: str, size=(20, 20)) -> ctk.CTkImage | None:
         color = "#ffffff" if modo == "Dark" else "#1a1a1a"
         r, g, b = int(color[1:3], 16), int(color[3:5], 16), int(color[5:7], 16)
         # Tiñe pixels no transparentes (vectorizado con list comprehension)
-        datas = img.getdata()
+        datas = img.get_flattened_data()
         new_data = [(r, g, b, a) if a > 0 else (0, 0, 0, 0) for *_, a in datas]
         img.putdata(new_data)
         ctk_img = ctk.CTkImage(light_image=img, dark_image=img, size=size)
@@ -139,6 +138,80 @@ def _hex_to_rgb(h: str) -> tuple[int, int, int]:
     if len(h) == 3:
         return (int(h[0]*2, 16), int(h[1]*2, 16), int(h[2]*2, 16))
     return (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
+
+
+# ---- Utilidad para grab modal seguro ----
+def _grab(win):
+    """Grab modal seguro (falla si la ventana aún no es visible)."""
+    try:
+        win.grab_set()
+    except tk.TclError:
+        pass
+
+
+# ---- Parche de rendimiento: update_idletasks() ----
+# customtkinter llama a update_idletasks() (un repaso GLOBAL de maquetación)
+# al final de CADA _draw de CTkOptionMenu y CTkScrollbar. Al construir una
+# ventana eso son ~40 repasos = ~1.5 s de ventana congelada. Mientras se
+# construye/recarga widgets solo se atiende 1 de cada 10 llamadas.
+_IDLETASKS_ORIG = tk.Misc.update_idletasks
+_IDLETASKS = {"activo": False, "n": 0, "flush": False, "en_curso": False}
+
+
+def _idletasks_limitado(self):
+    """Sustituto de update_idletasks(): acotado durante la construcción."""
+    if _IDLETASKS["en_curso"]:
+        # Repaso ANIDADO: customtkinter se llama a sí mismo.
+        #   CTkScrollbar._draw → self._canvas.update_idletasks()
+        #     → Tk dispara <Configure> → _update_dimensions_event
+        #       → otro _draw → otro update_idletasks() → recursión.
+        # Cada nivel recalculaba el layout COMPLETO de la ventana
+        # (~2.5 s de congelón al abrir). Se corta aquí: el layout se
+        # asienta solo cuando el bucle de Tk vuelve al control.
+        return None
+    if _IDLETASKS["flush"]:
+        # Dentro del repaso FINAL: los _draw anidados (scrollbars, etc.) no
+        # lanzan su propio repaso global. Antes cada scrollbar._draw hacía
+        # update_idletasks() real = ~24 repasos extra (~1 s) al cerrar el
+        # bloque _ui_rapida.
+        return None
+    if (type(self).__name__ == "CTkCanvas"
+            and type(getattr(self, "master", None)).__name__ == "CTkScrollbar"):
+        # CTkScrollbar._draw() termina con self._canvas.update_idletasks()
+        # (customtkinter 5.2.2, línea 161). Es un repaso GLOBAL que ocurre
+        # DESPUÉS de dibujar: no sirve para nada y arrastra la maquetación
+        # de toda la ventana (~1 s por cada barra de scroll). Se anula: el
+        # propio bucle de Tk se encarga de repintar la barra.
+        return None
+    if not _IDLETASKS["activo"]:
+        _IDLETASKS["en_curso"] = True
+        try:
+            return _IDLETASKS_ORIG(self)
+        finally:
+            _IDLETASKS["en_curso"] = False
+    # Durante la construcción no se hace NINGÚN repaso: customtkinter llama
+    # a update_idletasks() al final de cada _draw de optionmenu/scrollbar, y
+    # cada uno drenaba TODA la maquetación pendiente (~1 s de congelón).
+    # Los eventos los procesa el bucle normal de Tk al volver el control.
+    return None
+
+
+tk.Misc.update_idletasks = _idletasks_limitado
+
+
+@contextlib.contextmanager
+def _ui_rapida():
+    """Bloque de código con update_idletasks() acotado (UI sin congelones)."""
+    anterior = _IDLETASKS["activo"]
+    _IDLETASKS["activo"] = True
+    _IDLETASKS["n"] = 0
+    try:
+        yield
+    finally:
+        # NOTA: no se hace ningún repaso aquí. Los eventos de maquetación
+        # pendientes los procesa el bucle normal de Tk en cuanto vuelve el
+        # control: así el bloque no congela la ventana acabada de abrir.
+        _IDLETASKS["activo"] = anterior
 
 
 # ---- Tooltips y Loading States ----
@@ -173,22 +246,18 @@ def pch_importar_posts(posts, nombres, q):
         ("imp_fin", stats)
     `nombres` = {(service, id): nombre} del índice de artistas.
     """
-    import scraper   # import perezoso (playwright/bs4): solo al importar
-    scraper.set_site("pch")
+    from db import ComicRepository, PageRepository, fetch_all
     stats = {"nuevos": 0, "existentes": 0, "duplicados": 0,
              "sin_img": 0, "errores": 0, "fallos": []}
     try:
-        db = mysql.connector.connect(**DB)
+        # Títulos propios de pawchive (para desambiguar títulos repetidos)
+        filas = fetch_all("SELECT titulo, url_comic FROM comics "
+                          "WHERE sitio = %s", ("pawchive",))
     except Exception as e:
         q.put(("imp_fin", {**stats, "error": str(e)}))
         return
     try:
-        cursor = db.cursor(buffered=True)
-        otros = scraper.cargar_titulos_otros(cursor, "pawchive")
-        cursor.execute("SELECT titulo, url_comic FROM comics "
-                       "WHERE sitio = %s", ("pawchive",))
-        propios = {pawchive_api.norm_title(t): u
-                   for t, u in cursor.fetchall()}
+        propios = {pawchive_api.norm_title(t): u for t, u in filas}
         total = len(posts)
         for i, post in enumerate(posts, 1):
             titulo, res = "?", "error"
@@ -201,7 +270,7 @@ def pch_importar_posts(posts, nombres, q):
                     q.put(("imp", i, total, "post sin identificador", "error"))
                     continue
                 if pawchive_api.count_all_files_list(post) == 0:
-                    stats["sin_arch"] += 1
+                    stats["sin_img"] += 1
                     q.put(("imp", i, total,
                            str(post.get("title") or pid)[:60], "sin_img"))
                     continue
@@ -221,22 +290,19 @@ def pch_importar_posts(posts, nombres, q):
                 if dueno is not None and dueno != url:
                     titulo = f"{titulo} #{pid}"[:255]
                     norm = pawchive_api.norm_title(titulo)
-                r = scraper.insertar_comic(cursor, titulo, url, otros)
-                if r == "existe":
+                estado, cid_bd = ComicRepository.upsert(
+                    titulo, url, "pawchive", estado="pendiente")
+                if estado == "existe":
                     stats["existentes"] += 1
                     res = "existe"
-                    db.commit()
-                elif r == "duplicado":
+                elif estado == "duplicado":
                     propios[norm] = url
                     stats["duplicados"] += 1
                     res = "duplicado"
-                    db.commit()
                 else:
                     propios[norm] = url
-                    db.commit()              # tarjeta seguida
-                    cursor.execute(
-                        "SELECT id FROM comics WHERE url_comic = %s", (url,))
-                    cid_bd = cursor.fetchone()[0]
+                    if cid_bd is None:
+                        raise RuntimeError("no se pudo obtener el id del cómic")
                     try:
                         detalle = pawchive_api.fetch_post(service, cid, pid)
                         archivos = pawchive_api.all_files(detalle)
@@ -249,35 +315,27 @@ def pch_importar_posts(posts, nombres, q):
                         q.put(("imp", i, total, titulo[:60], res))
                         continue
                     if not archivos:
-                        scraper.guardar_metadata(cursor, cid_bd, 0, tags)
-                        db.commit()
-                        stats["sin_arch"] += 1
+                        ComicRepository.update_metadata(cid_bd, 0, tags)
+                        stats["sin_img"] += 1
                         res = "sin_img"
                     else:
-                        for n, a in enumerate(archivos, 1):
-                            cursor.execute(
-                                "INSERT IGNORE INTO paginas "
-                                "(comic_id, numero, url_imagen, tipo) "
-                                "VALUES (%s, %s, %s, %s)",
-                                (cid_bd, n, a["url"], a["tipo"]))
-                        scraper.guardar_metadata(cursor, cid_bd,
-                                                 len(archivos), tags)
-                        db.commit()
+                        paginas = [(n, a["url"], a["tipo"])
+                                   for n, a in enumerate(archivos, 1)]
+                        PageRepository.insert_batch_with_type(cid_bd, paginas)
+                        ComicRepository.update_metadata(cid_bd,
+                                                        len(archivos), tags)
                         stats["nuevos"] += 1
                         res = "nuevo"
             except Exception as e:
-                try:
-                    db.rollback()
-                except Exception:
-                    pass
                 stats["errores"] += 1
                 stats["fallos"].append(f"{post.get('id')}: {e}")
                 res = "error"
             q.put(("imp", i, total, titulo[:60], res))
-        cursor.close()
-    finally:
-        db.close()
+    except Exception as e:
+        stats["errores"] += 1
+        stats["fallos"].append(f"importación: {e}")
     q.put(("imp_fin", stats))
+
 
 # -------------- ESTADO COMPARTIDO ENTRE VENTANAS --------------
 # Ventanas de sitio abiertas: código (vcp/vmp/pch) -> SiteWindow
@@ -333,7 +391,7 @@ class Launcher(ctk.CTk):
         self.title("Gestor de Cómics — Lanzador")
         self.geometry("540x500")
         self.minsize(500, 460)
-        self.configure(fg_color=BG)
+        self.configure(fg_color=COLORS["BG"])
 
         self._counts_q: queue.Queue = queue.Queue()
         self.btns: dict[str, ctk.CTkButton] = {}
@@ -343,7 +401,7 @@ class Launcher(ctk.CTk):
         topbar.pack(fill="x", padx=24, pady=(20, 10))
         ctk.CTkLabel(topbar, text="\U0001f4da Gestor de Cómics",
                      font=("Segoe UI", 24, "bold"),
-                     text_color=TEXT).pack(side="left")
+                     text_color=COLORS["TEXT"]).pack(side="left")
         self.btn_theme = ctk.CTkButton(
             topbar, text="", width=36, height=36,
             image=_load_icon("sun-moon.svg", (20, 20)),
@@ -355,27 +413,26 @@ class Launcher(ctk.CTk):
         ctk.CTkLabel(self,
                      text="Una ventana por sitio \u00b7 elige por d\u00f3nde "
                           "quieres trabajar",
-                     font=("Segoe UI", 13), text_color=MUTED).pack()
+                     font=("Segoe UI", 13), text_color=COLORS["MUTED"]).pack()
 
         for code, info in SITES.items():
-            accent = SITE_ACCENTS[code]["base"]
             hover = SITE_ACCENTS[code]["hover"]
             btn = ctk.CTkButton(
                 self, text=f"{info['icon']} {info['label']}\n\u2026",
                 height=66, font=("Segoe UI", 15, "bold"),
-                fg_color=CARD_BG, hover_color=hover,
-                text_color=TEXT, border_width=1, border_color="#2e2e2e",
+                fg_color=COLORS["CARD_BG"], hover_color=hover,
+                text_color=COLORS["TEXT"], border_width=1, border_color="#2e2e2e",
                 command=lambda c=code: self.open_site(c))
             btn.pack(fill="x", padx=30, pady=(18, 0) if code == "vcp" else
                      (10, 0))
             self.btns[code] = btn
 
         self.lbl_db = ctk.CTkLabel(self, text="\u23f3 Cargando recuento\u2026",
-                                   font=("Segoe UI", 12), text_color=MUTED)
+                                   font=("Segoe UI", 12), text_color=COLORS["MUTED"])
         self.lbl_db.pack(pady=(16, 0))
 
         self.lbl_job = ctk.CTkLabel(self, text="\u2714 Sin trabajos en curso",
-                                    font=("Segoe UI", 12), text_color=MUTED)
+                                    font=("Segoe UI", 12), text_color=COLORS["MUTED"])
         self.lbl_job.pack(pady=(4, 0))
 
         bar = ctk.CTkFrame(self, fg_color="transparent")
@@ -385,14 +442,16 @@ class Launcher(ctk.CTk):
                       hover_color="#6e2424",
                       command=self._on_close).pack(side="right")
         ctk.CTkLabel(bar,
-                     text=f"BD: {DB['database']} @ {DB['host']}",
+                     text=f"BD: {DB_CONFIG['database']} @ {DB_CONFIG['host']}",
                      font=("Segoe UI", 11), text_color="#6f6f6f").pack(
             side="left")
 
         set_window_icon(self)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
-        self.after(250, self._restore_windows)
+        # No restaurar ventanas automáticamente al iniciar.
+        # El usuario abre manualmente las que quiera con los botones del lanzador.
+        # self.after(250, self._restore_windows)
         self.after(400, self._load_counts)
         self.after(600, self._poll)
 
@@ -428,7 +487,7 @@ class Launcher(ctk.CTk):
     def _load_counts(self):
         def work():
             try:
-                conn = mysql.connector.connect(**DB)
+                conn = mysql.connector.connect(**DB_CONFIG)
                 cur = conn.cursor()
                 cur.execute("SELECT sitio, COUNT(*) FROM comics "
                             "GROUP BY sitio")
@@ -445,9 +504,9 @@ class Launcher(ctk.CTk):
         if "__error__" in data:
             self.lbl_db.configure(
                 text="\u274c Sin conexi\u00f3n con MySQL (\u00bfXAMPP activo?)",
-                text_color=DANGER)
+                text_color=COLORS["DANGER"])
             return
-        por_sitio = {info["sitio"]: code for code, info in SITES.items()}
+        por_sitio = {info["nombre"]: code for code, info in SITES.items()}
         vistos = set()
         total = 0
         for sitio_bd, n in data.items():
@@ -466,8 +525,8 @@ class Launcher(ctk.CTk):
                     text=f"{info['icon']} {info['label']}\n0 c\u00f3mics")
         self.lbl_db.configure(
             text=f"\U0001f4c1 {fmt_num(total)} c\u00f3mics en la BD "
-                 f"({DB['database']})",
-            text_color=SUCCESS)
+                 f"({DB_CONFIG['database']})",
+            text_color=COLORS["SUCCESS"])
 
     # ---- Estado del trabajo global ----
     def _poll(self):
@@ -489,10 +548,10 @@ class Launcher(ctk.CTk):
             self.lbl_job.configure(
                 text=f"\u23f3 Trabajo en curso: {ACTIVE_JOB.get('name', '')} "
                      f"\u2014 ventana {owner.site_label}",
-                text_color=WARN)
+                text_color=COLORS["WARN"])
         else:
             self.lbl_job.configure(text="\u2714 Sin trabajos en curso",
-                                   text_color=MUTED)
+                                   text_color=COLORS["MUTED"])
         self.after(600, self._poll)
 
     def _on_close(self):
@@ -539,7 +598,7 @@ class SiteWindow(ctk.CTkToplevel):
         self.site = site                     # vcp | vmp | pch
         info = SITES[site]
         self.site_label = info["label"]      # VerComicsPorno / … / Pawchive
-        self.sitio = info["sitio"]           # valor en comics.sitio
+        self.sitio = info["nombre"]           # valor en comics.sitio
 
         self.title(f"Gestor de Cómics — {self.site_label}")
         # Geometría propia por sitio (recuerda tamaño y posición)
@@ -548,7 +607,7 @@ class SiteWindow(ctk.CTkToplevel):
                     "pch": "1280x820+110+90"}
         self.geometry(cfg.get(f"geo_{site}", defaults.get(site, "1280x820")))
         self.minsize(980, 620)
-        self.configure(fg_color=BG)
+        self.configure(fg_color=COLORS["BG"])
 
         # Canvas de fondo (gradiente + ruido) — detrás de todo
         self.bg_canvas = tk.Canvas(self, highlightthickness=0, bd=0)
@@ -556,7 +615,7 @@ class SiteWindow(ctk.CTkToplevel):
         self.bg_canvas.lower("all")
         self.bind("<Configure>", lambda e: self._draw_bg())
 
-        self.dest_var = tk.StringVar(value=cfg.get("dest", DEFAULT_DEST))
+        self.dest_var = tk.StringVar(value=cfg.get("dest", str(DEFAULT_DEST)))
         self.workers_var = tk.StringVar(value=str(cfg.get("workers", 6)))
         self.limit_var = tk.StringVar(value=str(cfg.get("limit", 0)))
         self.mode_var = tk.StringVar(
@@ -591,6 +650,7 @@ class SiteWindow(ctk.CTkToplevel):
                                              # pestaña Colección está oculta)
 
         self.dash: Dashboard | None = None  # se crea en _build_ui (pestaña)
+        self._dash_pasos = None              # iterador de pasos de construcción
 
         # Estado de la pestaña 🐾 Explorar (solo la ventana de Pawchive)
         self._pch_q: queue.Queue = queue.Queue()
@@ -600,11 +660,12 @@ class SiteWindow(ctk.CTkToplevel):
         self._pch_posts: list = []       # posts de la página actual
         self._pch_page = 0
         self._pch_busy = False           # cargando índice/posts/importando
+        self._pch_idx_loading = False    # leyendo caché del índice (hilo)
         self._pch_art_after = None       # debounce de la búsqueda de artistas
         self._pch_creator: tuple | None = None   # (svc, id, nombre) = modo
         self._pch_qglobal = ""                   # query global guardada
         self._pch_acum: dict = {}                # pid -> post (selección
-                                                  #   acumulada entre páginas)
+                                                   #   acumulada entre páginas)
 
         # ---- miniaturas (avatares artistas + thumbs posts) ----
         self._pch_thumb_imgs: dict[str, tk.PhotoImage] = {}  # clave -> imagen
@@ -612,9 +673,10 @@ class SiteWindow(ctk.CTkToplevel):
         self._pch_thumb_lock = threading.Lock()
         self._pch_thumb_hilos: list[threading.Thread] = []
 
-        self._build_ui()
-        set_window_icon(self)
-        self.refresh_table()
+        with _ui_rapida():          # construcción sin congelón (ver arriba)
+            self._build_ui()
+            set_window_icon(self)
+            # refresh_table() se llama al terminar la fase 3 (ver abajo)
 
         self.after(120, self._poll_queue)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -633,11 +695,8 @@ class SiteWindow(ctk.CTkToplevel):
 
     def _reload_icons(self):
         """Recarga iconos SVG en botones conocidos tras cambio de tema."""
-        # Botones de la pestaña Explorar (si existe)
-        if hasattr(self, "pch_list"):
-            # Los iconos en Treeview se actualizan solos con _draw_bg
-            pass
-        # Podrías añadir aquí recarga de iconos en botones específicos
+        # Los iconos en Treeview se actualizan solos con _draw_bg
+        pass
 
         # Cache de gradientes a nivel de clase: (w, h, modo, site) -> PhotoImage
     _BG_CACHE: dict[tuple[int, int, str, str], ImageTk.PhotoImage] = {}
@@ -681,8 +740,13 @@ class SiteWindow(ctk.CTkToplevel):
             self._bg_photo = ImageTk.PhotoImage(grad)
             self._BG_CACHE[cache_key] = self._bg_photo
 
-        self.bg_canvas.delete("bg")
-        self.bg_canvas.create_image(0, 0, anchor="nw", image=self._bg_photo, tags="bg")
+        try:
+            self.bg_canvas.delete("bg")
+            self.bg_canvas.create_image(0, 0, anchor="nw",
+                                        image=self._bg_photo, tags="bg")
+        except tk.TclError:
+            # la ventana ya se destruyó (el <Configure> llegó tarde)
+            pass
 
     def _lighten(self, hex_color: str, factor: float) -> str:
         """Aclara un color hex (0.0-1.0)."""
@@ -700,10 +764,10 @@ class SiteWindow(ctk.CTkToplevel):
         shadow = ctk.CTkFrame(parent, fg_color="#0a0a0a", corner_radius=radius)
         shadow.place(**{k: v for k, v in kwargs.items() if k in ("relx","rely","relwidth","relheight","x","y","width","height","anchor")})
         card = ctk.CTkFrame(parent,
-                            fg_color=CARD_BG,
+                            fg_color=COLORS["CARD_BG"],
                             corner_radius=radius,
                             border_width=1,
-                            border_color=BORDER)
+                            border_color=COLORS["BORDER"])
         card.place(**{k: v for k, v in kwargs.items() if k in ("relx","rely","relwidth","relheight","x","y","width","height","anchor")})
         card.lift(shadow)
         return card
@@ -714,13 +778,13 @@ class SiteWindow(ctk.CTkToplevel):
 
         # --- Pestañas: 📊 Dashboard / 📚 Colección ---
         self.tabview = ctk.CTkTabview(
-            self, fg_color=BG, corner_radius=0,
-            segmented_button_fg_color=PANEL,
-            segmented_button_selected_color=ACCENT,
-            segmented_button_selected_hover_color=ACCENT_HOVER,
-            segmented_button_unselected_color=CARD_BG,
+            self, fg_color=COLORS["BG"], corner_radius=0,
+            segmented_button_fg_color=COLORS["PANEL"],
+            segmented_button_selected_color=COLORS["ACCENT"],
+            segmented_button_selected_hover_color=COLORS["ACCENT_HOVER"],
+            segmented_button_unselected_color=COLORS["CARD_BG"],
             segmented_button_unselected_hover_color="#2e2e2e",
-            text_color=MUTED)
+            text_color=COLORS["MUTED"])
         self.tabview.pack(fill="both", expand=True)
 
         tab_dash = self.tabview.add("\U0001f4ca Dashboard")
@@ -733,13 +797,106 @@ class SiteWindow(ctk.CTkToplevel):
             self.after(300, self._pch_load_index)
             self.after(250, self._pch_poll)
 
-        # --- Pestaña 1: Dashboard (frame embebido de dashboard.py) ---
-        self.dash = Dashboard(tab_dash, self)
-        self.dash.pack(fill="both", expand=True)
+        self._tab_dash = tab_dash
+        self._tab_col = tab_col
+
+        # --- Placeholder: el Dashboard es lo más pesado (~1.2 s) y se
+        #     construye DESPUÉS de que la ventana sea visible ---
+        self._dash_ph = ctk.CTkLabel(
+            tab_dash, text="\u23f3 Cargando\u2026",
+            font=("Segoe UI", 15), text_color=COLORS["MUTED"])
+        self._dash_ph.pack(expand=True)
+
+        # --- Barra inferior FUERA de las pestañas (siempre visible) ---
+        bottom = ctk.CTkFrame(self, fg_color=COLORS["PANEL"], corner_radius=0, height=52)
+        bottom.pack(fill="x")
+        bottom.pack_propagate(False)
+        self.status_dot = ctk.CTkLabel(bottom, text="●", font=("Segoe UI", 14),
+                                       text_color=COLORS["MUTED"], width=18)
+        self.status_dot.pack(side="left", padx=(14, 0), pady=13)
+        ctk.CTkLabel(bottom, textvariable=self.status_var, font=small,
+                     text_color=COLORS["TEXT"], anchor="w").pack(
+            side="left", fill="x", expand=True, padx=(4, 10), pady=13)
+        self.pbar = ctk.CTkProgressBar(bottom, width=280, height=12)
+        self.pbar.pack(side="right", padx=(10, 12), pady=19)
+        self.pbar.set(0)
+        self.btn_stop = ctk.CTkButton(
+            bottom, text="⏹ Parar", width=92, height=32, font=small,
+            state="disabled", fg_color="#8c2f2f", hover_color="#6e2424",
+            command=self.stop_job)
+        self.btn_stop.pack(side="right", pady=10)
+
+        # Fases siguientes: se arrancan cuando la ventana ya está MAPEDA y
+        # pintada (evento <Map>), para que el usuario la vea al instante.
+        # OJO: <Map> salta también por cada widget hijo que se mapea, así que
+        # el binding se quita en cuanto se usa (si no, ~500 callbacks).
+        self._fase2_puesta = False
+        self._map_funcid = self.bind("<Map>", self._arrancar_fases, add="+")
+        self.after(600, self._arrancar_fases)     # red de seguridad
+
+    def _arrancar_fases(self, _e=None):
+        """Arranca la fase 2 (Dashboard) la primera vez que se ve la ventana."""
+        if self._fase2_puesta or not self.winfo_exists():
+            return
+        self._fase2_puesta = True
+        try:
+            self.unbind("<Map>", self._map_funcid)
+        except Exception:
+            pass
+        self.after(30, self._build_ui_dashboard)
+
+    def _build_ui_dashboard(self):
+        """Fase 2: Dashboard (frame embebido de dashboard.py).
+
+        Es la parte más pesada de la ventana, así que se construye cuando la
+        ventana ya se ha pintado: el usuario la ve al instante en vez de
+        esperarla congelada."""
+        if not self.winfo_exists():
+            return
+        with _ui_rapida():
+            if self._dash_ph is not None:
+                try:
+                    self._dash_ph.destroy()
+                except Exception:
+                    pass
+                self._dash_ph = None
+            self.dash = Dashboard(self._tab_dash, self, auto=False)
+            self.dash.pack(fill="both", expand=True)
+        # El dashboard tiene ~90 widgets: construirlo de una vez congela la
+        # ventana ~1 s. Se hace por pasos, cediendo el control a Tk entre
+        # uno y otro para que la ventana siga respondiendo.
+        self._dash_pasos = self.dash.pasos_build()
+        self.after(1, self._dash_paso)
+
+    def _dash_paso(self):
+        """Ejecuta el siguiente paso de construcción del dashboard."""
+        if not self.winfo_exists():
+            return
+        try:
+            paso = next(self._dash_pasos)
+        except StopIteration:
+            self._dash_pasos = None
+            self.after(1, self._build_ui_coleccion)
+            return
+        with _ui_rapida():
+            paso()
+        self.after(1, self._dash_paso)
+
+    def _build_ui_coleccion(self, *a, **k):
+        """Fase 3 con update_idletasks() acotado (sin congelón al rellenar)."""
+        with _ui_rapida():
+            return self._build_ui_coleccion_raw(*a, **k)
+
+    def _build_ui_coleccion_raw(self):
+        """Fase 3: pestaña Colección + primera carga de filas desde la BD."""
+        if not self.winfo_exists():
+            return
+        tab_col = self._tab_col
+        small = ("Segoe UI", 12)
 
         # --- Pestaña 2: Colección ---
         # Barra superior: buscador + filtro estado + refrescar + contador
-        top = ctk.CTkFrame(tab_col, fg_color=PANEL, corner_radius=0, height=60)
+        top = ctk.CTkFrame(tab_col, fg_color=COLORS["PANEL"], corner_radius=0, height=60)
         top.pack(fill="x")
         top.pack_propagate(False)
 
@@ -750,7 +907,7 @@ class SiteWindow(ctk.CTkToplevel):
                      font=small).pack(side="left", padx=(0, 14), pady=13)
 
         ctk.CTkLabel(top, text="Estado", font=small,
-                     text_color=MUTED).pack(side="left", padx=(0, 4))
+                     text_color=COLORS["MUTED"]).pack(side="left", padx=(0, 4))
         ctk.CTkOptionMenu(top, variable=self.filter_estado_var,
                           values=list(ESTADO_FILTROS), width=140, height=30,
                           font=("Segoe UI", 12),
@@ -762,7 +919,7 @@ class SiteWindow(ctk.CTkToplevel):
                       command=self.refresh_table).pack(side="left",
                                                        padx=(0, 10), pady=13)
         self.lbl_count = ctk.CTkLabel(top, text="", font=small,
-                                      text_color=MUTED)
+                                      text_color=COLORS["MUTED"])
         self.lbl_count.pack(side="right", padx=16)
 
         # --- Barra de selección (acciones sobre las filas marcadas) ---
@@ -771,7 +928,7 @@ class SiteWindow(ctk.CTkToplevel):
         self.sel_bar.pack(fill="x")
         self.sel_bar.pack_propagate(False)
         self.lbl_sel = ctk.CTkLabel(self.sel_bar, text="Sin selección",
-                                    font=small, text_color=MUTED)
+                                    font=small, text_color=COLORS["MUTED"])
         self.lbl_sel.pack(side="left", padx=(14, 10))
         ctk.CTkButton(
             self.sel_bar, text="\U0001f4c2 Abrir carpeta", width=140,
@@ -794,38 +951,38 @@ class SiteWindow(ctk.CTkToplevel):
             side="right", padx=14)
 
         # Tabla
-        tbl_frame = ctk.CTkFrame(tab_col, fg_color=PANEL, corner_radius=0)
+        tbl_frame = ctk.CTkFrame(tab_col, fg_color=COLORS["PANEL"], corner_radius=0)
         tbl_frame.pack(fill="both", expand=True)
 
         style = ttk.Style(self)
         style.theme_use("clam")
         style.configure("Dark.Treeview", background="#1a1a1a",
-                        fieldbackground="#1a1a1a", foreground=TEXT,
+                        fieldbackground="#1a1a1a", foreground=COLORS["TEXT"],
                         rowheight=28, font=("Segoe UI", 12), borderwidth=0)
         style.configure("Dark.Treeview.Heading", background="#2c2c2c",
-                        foreground=TEXT, font=("Segoe UI", 12, "bold"),
+                        foreground=COLORS["TEXT"], font=("Segoe UI", 12, "bold"),
                         borderwidth=0, relief="flat")
 
         style.configure("PchArt.Treeview", background="#1a1a1a",
-                        fieldbackground="#1a1a1a", foreground=TEXT,
+                        fieldbackground="#1a1a1a", foreground=COLORS["TEXT"],
                         rowheight=46, font=("Segoe UI", 12), borderwidth=0)
         style.configure("PchArt.Treeview.Heading", background="#2c2c2c",
-                        foreground=TEXT, font=("Segoe UI", 12, "bold"),
+                        foreground=COLORS["TEXT"], font=("Segoe UI", 12, "bold"),
                         borderwidth=0, relief="flat")
         style.configure("PchPost.Treeview", background="#1a1a1a",
-                        fieldbackground="#1a1a1a", foreground=TEXT,
+                        fieldbackground="#1a1a1a", foreground=COLORS["TEXT"],
                         rowheight=74, font=("Segoe UI", 12), borderwidth=0)
         style.configure("PchPost.Treeview.Heading", background="#2c2c2c",
-                        foreground=TEXT, font=("Segoe UI", 12, "bold"),
+                        foreground=COLORS["TEXT"], font=("Segoe UI", 12, "bold"),
                         borderwidth=0, relief="flat")
         style.map("Dark.Treeview",
-                  background=[("selected", ACCENT)],
+                  background=[("selected", COLORS["ACCENT"])],
                   foreground=[("selected", "#ffffff")])
         style.map("Dark.Treeview.Heading", background=[("selected", "#3a3a3a")])
         # Scrollbar oscura (la ttk por defecto es gris claro y choca)
         style.configure("Dark.Vertical.TScrollbar", background="#3a3a3a",
                         troughcolor="#161616", bordercolor="#161616",
-                        arrowcolor=TEXT)
+                        arrowcolor=COLORS["TEXT"])
         style.map("Dark.Vertical.TScrollbar",
                   background=[("active", "#4a4a4a")])
 
@@ -854,12 +1011,12 @@ class SiteWindow(ctk.CTkToplevel):
         # Filas rayadas + Estado en color (tags que no pisan la selección)
         self.tree.tag_configure("odd", background="#1a1a1a")
         self.tree.tag_configure("even", background="#202020")
-        self.tree.tag_configure("e_ok", foreground=SUCCESS)
-        self.tree.tag_configure("e_pend", foreground=WARN)
-        self.tree.tag_configure("e_dup", foreground=ORANGE)
+        self.tree.tag_configure("e_ok", foreground=COLORS["SUCCESS"])
+        self.tree.tag_configure("e_pend", foreground=COLORS["WARN"])
+        self.tree.tag_configure("e_dup", foreground=COLORS["ORANGE"])
         # Selección: los tags de fila tienen prioridad sobre el estilo,
         # así que la selección se pinta también con un tag explícito.
-        self.tree.tag_configure("sel", background=ACCENT,
+        self.tree.tag_configure("sel", background=COLORS["ACCENT"],
                                 foreground="#ffffff")
 
         self._sb = ttk.Scrollbar(tbl_frame, orient="vertical",
@@ -874,8 +1031,8 @@ class SiteWindow(ctk.CTkToplevel):
         self.tree.bind("<<TreeviewSelect>>", self._on_select)
 
         # --- Menú contextual (clic derecho) ---
-        self.ctx_menu = tk.Menu(self, tearoff=0, bg="#1e1e1e", fg=TEXT,
-                                activebackground=ACCENT, activeforeground="#ffffff",
+        self.ctx_menu = tk.Menu(self, tearoff=0, bg="#1e1e1e", fg=COLORS["TEXT"],
+                                activebackground=COLORS["ACCENT"], activeforeground="#ffffff",
                                 font=("Segoe UI", 11), borderwidth=0)
         self.ctx_menu.add_command(label="\U0001f4c2 Abrir carpeta",
                                   command=self._ctx_open_folder)
@@ -895,54 +1052,38 @@ class SiteWindow(ctk.CTkToplevel):
         self._empty_icon.pack(pady=(0, 6))
         self._empty_title = ctk.CTkLabel(self.empty, text="",
                                          font=("Segoe UI", 17, "bold"),
-                                         text_color=TEXT)
+                                         text_color=COLORS["TEXT"])
         self._empty_title.pack()
         self._empty_hint = ctk.CTkLabel(self.empty, text="",
-                                        font=small, text_color=MUTED)
+                                        font=small, text_color=COLORS["MUTED"])
         self._empty_hint.pack(pady=(4, 14))
         self.empty_btn = ctk.CTkButton(self.empty, text="", width=270,
                                        height=36, font=small,
-                                       fg_color=ACCENT,
-                                       hover_color=ACCENT_HOVER)
+                                       fg_color=COLORS["ACCENT"],
+                                       hover_color=COLORS["ACCENT_HOVER"])
         self.empty_btn.pack()
 
-        # --- Barra inferior FUERA de las pestañas (siempre visible) ---
-        bottom = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=0, height=52)
-        bottom.pack(fill="x")
-        bottom.pack_propagate(False)
-        self.status_dot = ctk.CTkLabel(bottom, text="●", font=("Segoe UI", 14),
-                                       text_color=MUTED, width=18)
-        self.status_dot.pack(side="left", padx=(14, 0), pady=13)
-        ctk.CTkLabel(bottom, textvariable=self.status_var, font=small,
-                     text_color=TEXT, anchor="w").pack(
-            side="left", fill="x", expand=True, padx=(4, 10), pady=13)
-        self.pbar = ctk.CTkProgressBar(bottom, width=280, height=12)
-        self.pbar.pack(side="right", padx=(10, 12), pady=19)
-        self.pbar.set(0)
-        self.btn_stop = ctk.CTkButton(
-            bottom, text="⏹ Parar", width=92, height=32, font=small,
-            state="disabled", fg_color="#8c2f2f", hover_color="#6e2424",
-            command=self.stop_job)
-        self.btn_stop.pack(side="right", pady=10)
+        # Primera carga de filas (la tabla ya existe)
+        self.refresh_table()
 
     # ---------------- PESTAÑA 🐾 EXPLORAR ----------------
     def _build_explorar(self, parent):
         """Pestaña 🐾 Explorar (solo Pawchive): artistas + buscador de posts."""
         small = ("Segoe UI", 12)
-        root = ctk.CTkFrame(parent, fg_color=BG, corner_radius=0)
+        root = ctk.CTkFrame(parent, fg_color=COLORS["BG"], corner_radius=0)
         root.pack(fill="both", expand=True)
 
         # ---------- IZQUIERDA: ARTISTAS ----------
-        iz = ctk.CTkFrame(root, fg_color=PANEL, corner_radius=10)
+        iz = ctk.CTkFrame(root, fg_color=COLORS["PANEL"], corner_radius=10)
         iz.pack(side="left", fill="both", expand=True, padx=(12, 6), pady=12)
 
         hdr = ctk.CTkFrame(iz, fg_color="transparent")
         hdr.pack(fill="x", padx=12, pady=(12, 6))
         ctk.CTkLabel(hdr, text="\U0001f3a8 Artistas",
                      font=("Segoe UI", 15, "bold"),
-                     text_color=ACCENT).pack(side="left")
+                     text_color=COLORS["ACCENT"]).pack(side="left")
         self.lbl_pch_idx = ctk.CTkLabel(hdr, text="índice: …",
-                                        font=small, text_color=MUTED)
+                                        font=small, text_color=COLORS["MUTED"])
         self.lbl_pch_idx.pack(side="right")
 
         fila1 = ctk.CTkFrame(iz, fg_color="transparent")
@@ -967,41 +1108,45 @@ class SiteWindow(ctk.CTkToplevel):
         self.pch_solo_var = tk.BooleanVar(value=False)
         ctk.CTkCheckBox(fila2, text="\u2605 Solo mis creadores",
                         variable=self.pch_solo_var, font=small,
-                        fg_color=ACCENT, hover_color=ACCENT_HOVER,
+                        fg_color=COLORS["ACCENT"], hover_color=COLORS["ACCENT_HOVER"],
                         command=self._pch_fill_artistas).pack(
             side="left", padx=(12, 0))
 
-        lst = ctk.CTkFrame(iz, fg_color="#1a1a1a", corner_radius=8)
-        lst.pack(fill="both", expand=True, padx=12, pady=(2, 8))
-        self.pch_list = ttk.Treeview(
-            lst, columns=("nombre", "servicio", "id"),
-            show="tree headings", style="PchArt.Treeview",
-            selectmode="extended")
-        self.pch_list.heading("#0", text="")
-        self.pch_list.column("#0", width=42, minwidth=42,
-                             stretch=False, anchor="center")
-        self.pch_list.heading("nombre", text="Artista")
-        self.pch_list.column("nombre", width=250, anchor="w")
-        self.pch_list.heading("servicio", text="Servicio")
-        self.pch_list.column("servicio", width=80, anchor="center")
-        self.pch_list.heading("id", text="ID")
-        self.pch_list.column("id", width=80, anchor="center")
-        sb_art = ttk.Scrollbar(lst, orient="vertical",
-                               style="Dark.Vertical.TScrollbar",
-                               command=self.pch_list.yview)
-        self.pch_list.configure(yscrollcommand=sb_art.set)
-        self.pch_list.pack(side="left", fill="both", expand=True,
-                           padx=(8, 0), pady=8)
-        sb_art.pack(side="right", fill="y", padx=(0, 8), pady=8)
+        # Grid de artistas con virtualización de viewport (solo visibles)
+        self.pch_artists_frame = ctk.CTkScrollableFrame(
+            iz, fg_color="#1a1a1a", corner_radius=8,
+            label_text="", label_font=("Segoe UI", 12))
+        self.pch_artists_frame.pack(fill="both", expand=True, padx=12, pady=(2, 8))
+        self.pch_artists_frame._scrollbar.configure(width=8)
+        # El scrollregion debe ser el ALTO TOTAL del índice (no solo las
+        # tarjetas renderizadas), o el viewport "ve" mucho menos y el scroll
+        # salta. Se reafirma DESPUÉS del handler de customtkinter (add="+").
+        self.pch_artists_frame.bind(
+            "<Configure>",
+            lambda _e: self._pch_ajustar_scrollregion(), add="+")
+        # Configurar grid: 4 columnas
+        for c in range(4):
+            self.pch_artists_frame.grid_columnconfigure(c, weight=1, minsize=180)
+
+        self.pch_artist_cards = {}  # idx -> card data
+        self.pch_selected_indices = set()
+        self.pch_visible_range = (0, 0)  # (start_idx, end_idx) visibles
+        self.pch_scroll_after = None     # debounce del scroll
+
+        # Detectar scroll para virtualización
+        self.pch_artists_frame._parent_canvas.bind(
+            "<MouseWheel>", lambda e: self._pch_on_artist_scroll(e))
+        self.pch_artists_frame._parent_canvas.bind(
+            "<Configure>", lambda e: self._pch_on_artist_scroll(e))
 
         self.lbl_pch_art_sel = ctk.CTkLabel(iz, text="Sin selección",
-                                            font=small, text_color=MUTED)
+                                            font=small, text_color=COLORS["MUTED"])
         self.lbl_pch_art_sel.pack(anchor="w", padx=14, pady=(0, 6))
         bots = ctk.CTkFrame(iz, fg_color="transparent")
         bots.pack(fill="x", padx=12, pady=(0, 12))
         self.btn_pch_add = ctk.CTkButton(
             bots, text=" Añadir a mis creadores", height=34,
-            font=small, fg_color=ACCENT, hover_color=ACCENT_HOVER,
+            font=small, fg_color=COLORS["ACCENT"], hover_color=COLORS["ACCENT_HOVER"],
             image=_load_icon("plus.svg", (18, 18)), compound="left",
             command=self._pch_add_creators)
         self.btn_pch_add.pack(side="left", fill="x", expand=True,
@@ -1016,7 +1161,7 @@ class SiteWindow(ctk.CTkToplevel):
         _add_tooltip(self.btn_pch_rem, "Quitar de mis creadores")
 
         # ---------- DERECHA: BUSCADOR DE POSTS ----------
-        de = ctk.CTkFrame(root, fg_color=PANEL, corner_radius=10)
+        de = ctk.CTkFrame(root, fg_color=COLORS["PANEL"], corner_radius=10)
         de.pack(side="right", fill="both", expand=True, padx=(6, 12),
                 pady=12)
 
@@ -1024,7 +1169,7 @@ class SiteWindow(ctk.CTkToplevel):
         hdr2.pack(fill="x", padx=12, pady=(12, 6))
         self.lbl_pch_titulo = ctk.CTkLabel(
             hdr2, text="\U0001f50d Buscador de posts",
-            font=("Segoe UI", 15, "bold"), text_color=ACCENT)
+            font=("Segoe UI", 15, "bold"), text_color=COLORS["ACCENT"])
         self.lbl_pch_titulo.pack(side="left")
         # Solo se enseña en modo "posts de un creador"
         self.btn_pch_volver = ctk.CTkButton(
@@ -1035,7 +1180,7 @@ class SiteWindow(ctk.CTkToplevel):
         self.btn_pch_volver.pack(side="left", padx=(10, 0))
         _add_tooltip(self.btn_pch_volver, "Volver a búsqueda global")
         self.lbl_pch_posts = ctk.CTkLabel(hdr2, text="\u2014",
-                                          font=small, text_color=MUTED)
+                                          font=small, text_color=COLORS["MUTED"])
         self.lbl_pch_posts.pack(side="right")
 
         fila3 = ctk.CTkFrame(de, fg_color="transparent")
@@ -1055,7 +1200,7 @@ class SiteWindow(ctk.CTkToplevel):
         self.pch_svc_posts_menu.pack(side="right", padx=(8, 0))
         self.btn_pch_buscar = ctk.CTkButton(
             fila3, text=" Buscar", width=100, height=32,
-            font=small, fg_color=ACCENT, hover_color=ACCENT_HOVER,
+            font=small, fg_color=COLORS["ACCENT"], hover_color=COLORS["ACCENT_HOVER"],
             image=_load_icon("search.svg", (18, 18)), compound="left",
             command=lambda: self._pch_buscar(0))
         self.btn_pch_buscar.pack(side="right", padx=(8, 0))
@@ -1099,7 +1244,7 @@ class SiteWindow(ctk.CTkToplevel):
         self.btn_pch_prev.pack(side="left")
         _add_tooltip(self.btn_pch_prev, "Página anterior")
         self.lbl_pch_pag = ctk.CTkLabel(pag, text="Página 0", font=small,
-                                        text_color=MUTED, width=90)
+                                        text_color=COLORS["MUTED"], width=90)
         self.lbl_pch_pag.pack(side="left", padx=6)
         self.btn_pch_next = ctk.CTkButton(
             pag, text="Siguiente ", width=100, height=30, font=small,
@@ -1152,7 +1297,7 @@ class SiteWindow(ctk.CTkToplevel):
         self.pch_dl_types_menu.pack(side="left", padx=(8, 0))
         _add_tooltip(self.pch_dl_types_menu, "Tipos de archivo a descargar")
         self.lbl_pch_imp = ctk.CTkLabel(imp, text="Sin selección",
-                                        font=small, text_color=MUTED)
+                                        font=small, text_color=COLORS["MUTED"])
         self.lbl_pch_imp.pack(side="right", padx=(10, 0))
 
         ctk.CTkLabel(de,
@@ -1169,12 +1314,7 @@ class SiteWindow(ctk.CTkToplevel):
                                 lambda _e: self._pch_schedule_art())
         self.pch_svc_var.trace_add(
             "write", lambda *_: self._pch_fill_artistas())
-        self.pch_list.bind("<<TreeviewSelect>>", self._pch_sel_artistas)
-        self.pch_list.bind("<ButtonRelease-1>", self._pch_ver_posts)
-        self.pch_list.bind("<Double-1>", self._pch_open_artista)
-        self.pch_tree.bind("<<TreeviewSelect>>", self._pch_sel_posts)
-        self.pch_tree.bind("<Double-1>", self._pch_open_post)
-        # Preview panel en hover
+        # Preview panel en hover (para posts)
         self.pch_tree.bind("<Motion>", self._pch_on_tree_motion)
         self.pch_tree.bind("<Leave>", self._pch_hide_preview)
         self._pch_preview_win = None
@@ -1198,15 +1338,17 @@ class SiteWindow(ctk.CTkToplevel):
             self._pch_set_idx(m[1], m[2])
         elif tipo == "idx_err":
             self._pch_busy = False
+            self._pch_idx_loading = False
+            _set_loading(self.btn_refresh_idx, False, "\U0001f504")
             self.lbl_pch_idx.configure(text=f"\u274c {m[1]}",
-                                       text_color=DANGER)
+                                       text_color=COLORS["DANGER"])
         elif tipo == "posts":
             self._pch_fill_posts(m[1], m[2])
         elif tipo == "posts_err":
             self._pch_busy = False
             self.btn_pch_buscar.configure(state="normal")
             self.lbl_pch_posts.configure(text=f"\u274c {m[1]}",
-                                         text_color=DANGER)
+                                         text_color=COLORS["DANGER"])
         elif tipo == "imp":
             _, i, total, titulo, res = m
             ico = {"nuevo": "\u2705", "existe": "\u21a9\ufe0f",
@@ -1215,30 +1357,52 @@ class SiteWindow(ctk.CTkToplevel):
             self.log(f"  [{i}/{total}] {ico} {res}: {titulo}")
             self.lbl_pch_imp.configure(
                 text=f"\u23f3 Importando {i}/{total}\u2026",
-                text_color=WARN)
+                text_color=COLORS["WARN"])
         elif tipo == "imp_fin":
             self._pch_import_fin(m[1])
 
     # ---- índice de artistas (caché + API) ----
     def _pch_load_index(self, forzar=False):
-        if self._pch_busy:
+        if self._pch_busy or self._pch_idx_loading:
+            return
+        # 1) caché en memoria (ya convertida y ordenada) -> instantáneo
+        if not forzar and _PCH_IDX_MEM["filas"] is not None:
+            self._pch_set_idx(_PCH_IDX_MEM["filas"], _PCH_IDX_MEM["at"])
             return
         if not forzar:
-            try:
-                data = json.loads(
-                    PCH_INDEX_FILE.read_text(encoding="utf-8"))
-                creadores = data.get("creators")
-                if creadores:
-                    self._pch_set_idx(creadores, data.get("at", "caché"))
-                    return
-            except Exception:
-                pass
+            # 2) caché en disco (4 MB): se lee y parsea en un Hilo para que
+            #    la ventana se abra al instante y no se congele la UI.
+            self._pch_idx_loading = True
+            _set_loading(self.btn_refresh_idx, True, "\U0001f504")
+            self.lbl_pch_idx.configure(
+                text="\u23f3 Cargando índice\u2026",
+                text_color=COLORS["WARN"])
+            threading.Thread(target=self._pch_cache_worker,
+                             daemon=True).start()
+            return
         self._pch_busy = True
         _set_loading(self.btn_refresh_idx, True, "\U0001f504")
         self.lbl_pch_idx.configure(
             text="\u23f3 Descargando índice de artistas\u2026",
-            text_color=WARN)
+            text_color=COLORS["WARN"])
         threading.Thread(target=self._pch_idx_worker, daemon=True).start()
+
+    def _pch_cache_worker(self):
+        """Lee la caché del índice (4 MB) y la convierte/ordena SIN bloquear
+        la UI. Si la caché no sirve, cae a descargar el índice de la API."""
+        try:
+            data = json.loads(
+                PCH_INDEX_FILE.read_text(encoding="utf-8"))
+            creadores = data.get("creators")
+            if not creadores:
+                raise ValueError("caché vacía")
+            filas = _normalizar_idx(creadores)
+            at = str(data.get("at") or "caché")
+            _PCH_IDX_MEM["at"] = at
+            _PCH_IDX_MEM["filas"] = filas
+            self._pch_q.put(("idx", filas, at))
+        except Exception:
+            self._pch_idx_worker()        # sin caché útil -> red
 
     def _pch_idx_worker(self):
         try:
@@ -1247,32 +1411,35 @@ class SiteWindow(ctk.CTkToplevel):
                           str(c.get("service") or ""),
                           int(c.get("favorited") or 0)]
                          for c in d if isinstance(c, dict)]
+            filas = _normalizar_idx(creadores)   # convierte + ordena (hilo)
             at = time.strftime("%d/%m/%Y %H:%M")
             try:
                 PCH_INDEX_FILE.write_text(
-                    json.dumps({"at": at, "creators": creadores},
+                    json.dumps({"at": at, "creators": filas},
                                ensure_ascii=False), encoding="utf-8")
             except Exception:
                 pass
-            self._pch_q.put(("idx", creadores, at))
+            _PCH_IDX_MEM["at"] = at
+            _PCH_IDX_MEM["filas"] = filas
+            self._pch_q.put(("idx", filas, at))
         except Exception as e:
             self._pch_q.put(("idx_err", str(e)))
 
     def _pch_set_idx(self, creadores, at):
-        filas = []
-        for c in creadores:
-            try:
-                filas.append((str(c[0]), str(c[1]), str(c[2]), int(c[3])))
-            except Exception:
-                continue
-        filas.sort(key=lambda r: -r[3])        # más populares primero
+        if creadores and isinstance(creadores[0], tuple):
+            filas = creadores          # ya convertido y ordenado (hilo)
+        else:
+            filas = _normalizar_idx(creadores)
         self._pch_idx = filas
         self._pch_nom = {(s, i): n for i, n, s, _f in filas}
+        _PCH_IDX_MEM["at"] = at
+        _PCH_IDX_MEM["filas"] = filas
         self._pch_busy = False
+        self._pch_idx_loading = False
         _set_loading(self.btn_refresh_idx, False, "\U0001f504")
         self.lbl_pch_idx.configure(
             text=f"índice: {fmt_num(len(filas))} artistas · {at}",
-            text_color=MUTED)
+            text_color=COLORS["MUTED"])
         self._pch_fill_artistas()
 
     # ---- lista de artistas ----
@@ -1284,8 +1451,13 @@ class SiteWindow(ctk.CTkToplevel):
                 pass
         self._pch_art_after = self.after(300, self._pch_fill_artistas)
 
-    def _pch_fill_artistas(self, *_):
-        if getattr(self, "pch_list", None) is None:
+    def _pch_fill_artistas(self, *args, **kwargs):
+        """Rellena el grid de artistas con update_idletasks() acotado."""
+        with _ui_rapida():
+            return self._pch_fill_artistas_raw(*args, **kwargs)
+
+    def _pch_fill_artistas_raw(self, *_):
+        if getattr(self, "pch_artists_frame", None) is None:
             return
         q = self.pch_entry_art.get().strip().lower()
         svc = PCH_SVC_LABELS.get(self.pch_svc_var.get(), "")
@@ -1306,55 +1478,280 @@ class SiteWindow(ctk.CTkToplevel):
             if len(out) >= PCH_IDX_MAX:
                 break
         self._pch_view = out
-        tree = self.pch_list
-        tree.delete(*tree.get_children())
-        for idx, (s, i, n) in enumerate(out):
-            clave = f"creator:{s}:{i}"
-            ph = self._pch_thumb_imgs.get(clave)
-            kw = {"iid": str(idx), "values": (n, s, i),
-                  "tags": ("odd" if idx % 2 else "even",)}
-            if ph is not None:
-                kw["image"] = ph
-            tree.insert("", "end", **kw)
+
+        # Limpiar grid anterior y crear solo tarjetas visibles
+        for widget in self.pch_artists_frame.winfo_children():
+            widget.destroy()
+        self.pch_artist_cards.clear()
+        self.pch_selected_indices.clear()
+        self.pch_visible_range = (0, 0)
+        self._pch_ajustar_scrollregion()
+
+        self._pch_render_visible()
+        self._pch_descargar_artistas_faltantes_visible()
         self._pch_sel_artistas()
-        self._pch_descargar_artistas_faltantes(out)
+
+    def _create_artist_card(self, idx, service, cid, name, row, col):
+        """Crea una tarjeta de artista en el grid."""
+        clave = f"creator:{service}:{cid}"
+        ph = self._pch_thumb_imgs.get(clave)
+
+        # Frame de la tarjeta
+        card = ctk.CTkFrame(
+            self.pch_artists_frame,
+            fg_color="#222222",
+            corner_radius=10,
+            border_width=2,
+            border_color="#333333",
+            width=180,
+            height=220)
+        card.grid(row=row, column=col, padx=8, pady=8, sticky="nsew")
+        card.grid_propagate(False)
+        card.grid_columnconfigure(0, weight=1)
+
+        # Imagen de fondo (avatar)
+        img_label = ctk.CTkLabel(card, text="", image=ph)
+        img_label.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
+        card.rowconfigure(0, weight=1)
+
+        # Overlay con información
+        overlay = ctk.CTkFrame(card, fg_color=("#000000", "#000000"), corner_radius=8)
+        overlay.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
+        overlay.grid_columnconfigure(0, weight=1)
+        overlay.rowconfigure(1, weight=1)
+
+        # Nombre del artista
+        name_label = ctk.CTkLabel(
+            overlay, text=name[:25], font=("Segoe UI", 13, "bold"),
+            text_color="white", wraplength=160)
+        name_label.grid(row=0, column=0, padx=8, pady=(8, 2), sticky="ew")
+
+        # Servicio e ID
+        info_text = f"{service} · {cid}"
+        info_label = ctk.CTkLabel(
+            overlay, text=info_text, font=("Segoe UI", 10),
+            text_color="#cccccc")
+        info_label.grid(row=1, column=0, padx=8, pady=(0, 8), sticky="s")
+
+        # Guardar referencia
+        self.pch_artist_cards[idx] = {
+            "frame": card,
+            "img_label": img_label,
+            "overlay": overlay,
+            "name_label": name_label,
+            "info_label": info_label,
+            "service": service,
+            "cid": cid,
+            "name": name,
+            "selected": idx in self.pch_selected_indices}
+        card.bind("<Button-1>", lambda e, i=idx: self._on_artist_card_click(i, e))
+        card.bind("<Double-1>", lambda e, i=idx: self._on_artist_card_double(i, e))
+        img_label.bind("<Button-1>", lambda e, i=idx: self._on_artist_card_click(i, e))
+        overlay.bind("<Button-1>", lambda e, i=idx: self._on_artist_card_click(i, e))
+        name_label.bind("<Button-1>", lambda e, i=idx: self._on_artist_card_click(i, e))
+        info_label.bind("<Button-1>", lambda e, i=idx: self._on_artist_card_click(i, e))
+
+        # Programar descarga de miniatura si falta
+        if clave not in self._pch_thumb_imgs:
+            url = pawchive_api.thumb_creator_url(service, cid)
+            self._pch_bajar_thumb(clave, url, 172, 172)
+
+    def _pch_on_artist_scroll(self, event=None):
+        """Debounced scroll handler para virtualización."""
+        if self.pch_scroll_after is not None:
+            self.after_cancel(self.pch_scroll_after)
+        self.pch_scroll_after = self.after(50, self._pch_render_visible)
+
+    def _pch_ajustar_scrollregion(self):
+        """Fija el scrollregion al TAMAÑO TOTAL del índice de artistas.
+
+        Al renderizar solo las tarjetas visibles, el frame interior mide
+        menos que el índice completo: sin esto el canvas cree que el
+        contenido es mucho más corto de lo que es.
+        """
+        if not getattr(self, "pch_artists_frame", None):
+            return
+        try:
+            total = len(self._pch_view)
+            if total == 0:
+                return
+            canvas = self.pch_artists_frame._parent_canvas
+            filas = (total + 3) // 4            # 4 columnas
+            alto = filas * 240                   # tarjeta 220 + padding 20
+            ancho = max(int(canvas.winfo_width()), 1)
+            canvas.configure(scrollregion=(0, 0, ancho, alto))
+        except Exception:
+            pass
+
+    def _pch_render_visible(self, _reintento=0):
+        """Renderiza las tarjetas visibles (con update_idletasks acotado)."""
+        with _ui_rapida():
+            return self._pch_render_visible_raw(_reintento)
+
+    def _pch_render_visible_raw(self, _reintento=0):
+        """Renderiza solo las tarjetas visibles en el viewport."""
+        if not self.pch_artists_frame.winfo_exists():
+            return
+
+        # Calcular qué filas son visibles
+        canvas = self.pch_artists_frame._parent_canvas
+        try:
+            canvas_y = canvas.yview()
+            y_top, y_bot = canvas_y[0], canvas_y[1]
+            h = int(canvas.winfo_height())
+        except Exception:
+            return
+
+        total = len(self._pch_view)
+        if total == 0:
+            return
+
+        # Ventana aún sin maquetar (alto 0): se reintenta enseguida.
+        if h < 60:
+            if _reintento < 30:
+                self.after(100,
+                           lambda: self._pch_render_visible(_reintento + 1))
+            return
+
+        # Cuántas tarjetas caben DE VERDAD en pantalla. Ojo: yview() devuelve
+        # 0..1 y antes de maquetar es (0, 1) -> con eso se dibujaban las 1500
+        # tarjetas de golpe y la ventana se quedaba congelada al abrirla.
+        card_h = 240                      # alto aprox. de tarjeta + padding
+        filas_vis = max(1, h // card_h + 1)
+        por_vis = filas_vis * 4 + 8       # 4 columnas + margen de seguridad
+        first_visible = max(0, int(y_top * total) - 4)
+        start = first_visible
+        end = min(total, start + por_vis)
+        # Si estamos al final del scroll, asegurar el llenado hacia atrás
+        if y_bot >= 0.999:
+            start = max(0, total - por_vis)
+            end = total
+
+        start, end = int(start), int(end)
+
+        if (start, end) == self.pch_visible_range:
+            return
+        self.pch_visible_range = (start, end)
+
+        # Crear tarjetas nuevas visibles
+        for idx in range(start, end):
+            if idx in self.pch_artist_cards:
+                continue
+            s, i, n = self._pch_view[idx]
+            row = idx // 4
+            col = idx % 4
+            self._create_artist_card(idx, s, i, n, row, col)
+
+        # Destruir tarjetas que salieron del viewport (la SELECCIÓN se
+        # conserva en `pch_selected_indices`: solo se quitan los widgets)
+        to_remove = []
+        for idx in self.pch_artist_cards:
+            if idx < start or idx >= end:
+                to_remove.append(idx)
+        for idx in to_remove:
+            self.pch_artist_cards.pop(idx)["frame"].destroy()
+
+        self._pch_ajustar_scrollregion()
+        self._pch_sel_artistas()
+        self._pch_descargar_artistas_faltantes_visible()
+
+    def _pch_descargar_artistas_faltantes_visible(self):
+        """Descarga avatares solo de artistas visibles."""
+        for idx in range(*self.pch_visible_range):
+            if idx >= len(self._pch_view):
+                continue
+            s, i, _n = self._pch_view[idx]
+            clave = f"creator:{s}:{i}"
+            if clave in self._pch_thumb_imgs:
+                continue
+            url = pawchive_api.thumb_creator_url(s, i)
+            self._pch_bajar_thumb(clave, url, 172, 172)
+
+    def _pch_update_card_style(self, idx):
+        """Actualiza el estilo visual de una tarjeta según selección."""
+        if idx not in self.pch_artist_cards:
+            return
+        card_data = self.pch_artist_cards[idx]
+        selected = idx in self.pch_selected_indices
+        card_data["selected"] = selected
+        frame = card_data["frame"]
+        overlay = card_data["overlay"]
+        if selected:
+            frame.configure(border_color=COLORS["ACCENT"], border_width=3)
+            overlay.configure(fg_color=(COLORS["ACCENT"], COLORS["ACCENT"]))
+        else:
+            frame.configure(border_color="#333333", border_width=2)
+            overlay.configure(fg_color=("#000000", "#000000"))
+
+    def _on_artist_card_click(self, idx, event=None):
+        """Clic en una tarjeta de artista del grid.
+
+        Selecciona la tarjeta y carga sus posts en el panel derecho.
+        Con Ctrl/Cmd se añade a la selección (selección múltiple)."""
+        if idx < 0 or idx >= len(self._pch_view):
+            return
+        # Ctrl/Cmd -> selección múltiple; en el resto, solo la tarjeta clicada
+        multi = bool(event is not None and (event.state & 0x0004))
+        if multi:
+            if idx in self.pch_selected_indices:
+                self.pch_selected_indices.discard(idx)
+            else:
+                self.pch_selected_indices.add(idx)
+        else:
+            self.pch_selected_indices = {idx}
+        self._pch_sel_artistas()
+        # Con una sola selección cargamos directamente sus posts
+        if len(self.pch_selected_indices) == 1:
+            self._pch_ver_posts_from_selection()
+
+    def _on_artist_card_double(self, idx, event=None):
+        """Doble clic: abre perfil del artista en navegador."""
+        if idx not in self.pch_artist_cards:
+            return
+        card = self.pch_artist_cards[idx]
+        webbrowser.open(pawchive_api.creator_url(card["service"], card["cid"]))
+
+    def _pch_ver_posts_from_selection(self):
+        """Carga posts del artista seleccionado (desde selección actual)."""
+        if len(self.pch_selected_indices) != 1:
+            return
+        idx = next(iter(self.pch_selected_indices))
+        if idx >= len(self._pch_view):
+            return
+        s, i, n = self._pch_view[idx]
+        if self._pch_creator and self._pch_creator[:2] == (s, i):
+            return
+        self._pch_qglobal = self.pch_entry_posts.get()
+        self._pch_creator = (s, i, n)
+        self._pch_aplicar_modo()
+        self._pch_buscar(0)
 
     def _pch_sel_artistas(self, _e=None):
-        n = len(self.pch_list.selection())
+        """Actualiza UI según selección actual."""
+        for idx in self.pch_artist_cards:
+            self._pch_update_card_style(idx)
+
+        n = len(self.pch_selected_indices)
         self.lbl_pch_art_sel.configure(
             text="Sin selección" if not n else
             f"{n} seleccionado{'s' if n != 1 else ''}",
-            text_color=MUTED if not n else ACCENT)
+            text_color=COLORS["MUTED"] if not n else COLORS["ACCENT"])
 
     def _pch_open_artista(self, _e=None):
-        sel = self.pch_list.selection()
-        if not sel:
+        """Abre perfil del artista (para compatibilidad, no se usa en grid)."""
+        if not self.pch_selected_indices:
             return
-        idx = int(sel[0])
+        idx = next(iter(self.pch_selected_indices))
+        if idx >= len(self._pch_view):
+            return
         s, i, _n = self._pch_view[idx]
         webbrowser.open(pawchive_api.creator_url(s, i))
 
     # ---- modo "posts de un creador" (clic en la lista de artistas) ----
     def _pch_ver_posts(self, _e=None):
-        """Clic en un artista -> carga SUS posts en el panel derecho.
-
-        Se bindea a <ButtonRelease-1> (no a <<TreeviewSelect>>) para que
-        recorrer la lista con las flechas no dispare peticiones."""
-        if self._pch_busy:
-            return                      # cargando/importando: sin cambios
-        sel = self.pch_list.selection()
-        if len(sel) != 1:
-            return                      # varios (o ninguno): no cargamos
-        idx = int(sel[0])
-        if idx >= len(self._pch_view):
-            return
-        s, i, n = self._pch_view[idx]
-        if self._pch_creator and self._pch_creator[:2] == (s, i):
-            return                      # ya estaba cargado ese creador
-        self._pch_qglobal = self.pch_entry_posts.get()
-        self._pch_creator = (s, i, n)
-        self._pch_aplicar_modo()
-        self._pch_buscar(0)
+        """Clic en un artista -> carga SUS posts en el panel derecho."""
+        # Para compatibilidad con el bind antiguo
+        self._pch_ver_posts_from_selection()
 
     def _pch_volver(self):
         """Vuelve a la búsqueda global (recupera la query anterior)."""
@@ -1387,8 +1784,13 @@ class SiteWindow(ctk.CTkToplevel):
                 self.pch_entry_posts.insert(0, self._pch_qglobal)
 
     def _pch_add_creators(self):
-        sel = [self._pch_view[int(iid)] for iid in self.pch_list.selection()
-               if 0 <= int(iid) < len(self._pch_view)]
+        if not self.pch_selected_indices:
+            messagebox.showinfo("Artistas",
+                                "Selecciona al menos un artista de la lista.",
+                                parent=self)
+            return
+        sel = [self._pch_view[idx] for idx in self.pch_selected_indices
+               if 0 <= idx < len(self._pch_view)]
         if not sel:
             messagebox.showinfo("Artistas",
                                 "Selecciona al menos un artista de la lista.",
@@ -1410,18 +1812,19 @@ class SiteWindow(ctk.CTkToplevel):
             self._pch_fill_artistas()
 
     def _pch_rem_creators(self):
+        if not self.pch_selected_indices:
+            messagebox.showinfo("Artistas",
+                                "Selecciona al menos un artista de la lista.",
+                                parent=self)
+            return
         sel = set()
-        for j in self.pch_list.selection():
-            try:
-                idx = int(j)
-            except ValueError:
-                continue
+        for idx in self.pch_selected_indices:
             if 0 <= idx < len(self._pch_view):
                 s, i, _n = self._pch_view[idx]
                 sel.add((s, i))
         if not sel:
             messagebox.showinfo("Artistas",
-                                "Selecciona al menos un artista de la lista.",
+                                "Ninguno de los seleccionados está en tu lista.",
                                 parent=self)
             return
         actuales = pawchive_api.load_creators()
@@ -1460,7 +1863,7 @@ class SiteWindow(ctk.CTkToplevel):
             self.lbl_pch_posts.configure(
                 text=f"\u23f3 Cargando posts de {nombre} "
                      f"(p\u00e1gina {page + 1})\u2026",
-                text_color=WARN)
+                text_color=COLORS["WARN"])
             params = []
             if q:
                 params.append("q=" + quote(q))
@@ -1469,7 +1872,7 @@ class SiteWindow(ctk.CTkToplevel):
         else:
             self.lbl_pch_posts.configure(
                 text=f"\u23f3 Buscando\u2026 (p\u00e1gina {page + 1})",
-                text_color=WARN)
+                text_color=COLORS["WARN"])
             svc = PCH_SVC_LABELS.get(self.pch_svc_posts_var.get(), "")
             params = []
             if q:
@@ -1518,7 +1921,7 @@ class SiteWindow(ctk.CTkToplevel):
         self.btn_pch_next.configure(
             state="normal" if len(posts) >= 50 else "disabled")
         self.lbl_pch_posts.configure(
-            text=f"{len(posts)} posts", text_color=MUTED)
+            text=f"{len(posts)} posts", text_color=COLORS["MUTED"])
         # Re-marca en el árbol los que ya estaban seleccionados en otra
         # página (la selección se acumula: _pch_acum es la fuente de verdad)
         previos = [str(i) for i, p in enumerate(posts)
@@ -1536,18 +1939,12 @@ class SiteWindow(ctk.CTkToplevel):
             if clave in self._pch_thumb_imgs:
                 continue
             url = pawchive_api.thumb_creator_url(s, i)
-            self._pch_bajar_thumb(clave, url, 36, 36)
+            self._pch_bajar_thumb(clave, url, 172, 172)
 
     def _pch_descargar_posts_faltantes(self):
         """Dispara la descarga en segundo plano de las miniaturas de posts
         que faltan en la página actual."""
-        for iid in self.pch_tree.get_children():
-            try:
-                idx = int(iid)
-            except ValueError:
-                continue
-            if not (0 <= idx < len(self._pch_posts)):
-                continue
+        for idx in range(len(self._pch_posts)):
             p = self._pch_posts[idx]
             clave = f"post:{p.get('service')}:{p.get('user')}:{p.get('id')}"
             if clave in self._pch_thumb_imgs:
@@ -1598,20 +1995,24 @@ class SiteWindow(ctk.CTkToplevel):
         ph = self._pch_thumb_imgs.get(clave)
         if ph is None:
             return
-        for iid in self.pch_list.get_children():
-            vals = self.pch_list.item(iid, "values")
-            if len(vals) >= 3 and f"creator:{vals[1]}:{vals[2]}" == clave:
-                self.pch_list.item(iid, image=ph)
-        for iid in self.pch_tree.get_children():
-            try:
-                idx = int(iid)
-            except ValueError:
-                continue
-            if not (0 <= idx < len(self._pch_posts)):
-                continue
-            p = self._pch_posts[idx]
-            if f"post:{p.get('service')}:{p.get('user')}:{p.get('id')}" == clave:
-                self.pch_tree.item(iid, image=ph)
+        # Actualizar tarjetas de artistas
+        if clave.startswith("creator:"):
+            for idx, card_data in self.pch_artist_cards.items():
+                card_clave = f"creator:{card_data['service']}:{card_data['cid']}"
+                if card_clave == clave:
+                    card_data["img_label"].configure(image=ph)
+        # Actualizar thumbnails de posts (si existe el tree)
+        if hasattr(self, "pch_tree") and self.pch_tree.winfo_exists():
+            for iid in self.pch_tree.get_children():
+                try:
+                    idx = int(iid)
+                except ValueError:
+                    continue
+                if not (0 <= idx < len(self._pch_posts)):
+                    continue
+                p = self._pch_posts[idx]
+                if f"post:{p.get('service')}:{p.get('user')}:{p.get('id')}" == clave:
+                    self.pch_tree.item(iid, image=ph)
 
     def _pch_sel_posts(self, _e=None):
         """Sincroniza el árbol con la selección ACUMULADA (`_pch_acum`).
@@ -1635,7 +2036,7 @@ class SiteWindow(ctk.CTkToplevel):
         self.lbl_pch_imp.configure(
             text="Sin selección" if not n else
             f"{n} seleccionado{'s' if n != 1 else ''}",
-            text_color=MUTED if not n else ACCENT)
+            text_color=COLORS["MUTED"] if not n else COLORS["ACCENT"])
         self.btn_pch_imp.configure(
             state="normal" if (n and not self._pch_busy) else "disabled")
 
@@ -1681,15 +2082,15 @@ class SiteWindow(ctk.CTkToplevel):
         self._pch_preview_win = ctk.CTkToplevel(self)
         self._pch_preview_win.wm_overrideredirect(True)
         self._pch_preview_win.attributes("-topmost", True)
-        self._pch_preview_win.configure(fg_color=CARD_BG)
+        self._pch_preview_win.configure(fg_color=COLORS["CARD_BG"])
         # Contenido
-        frame = ctk.CTkFrame(self._pch_preview_win, fg_color=CARD_BG, corner_radius=8,
-                             border_width=1, border_color=BORDER)
+        frame = ctk.CTkFrame(self._pch_preview_win, fg_color=COLORS["CARD_BG"], corner_radius=8,
+                             border_width=1, border_color=COLORS["BORDER"])
         frame.pack(padx=1, pady=1)
         # Título
         titulo = (str(p.get("title") or "").strip() or f"post {p.get('id')}")
         ctk.CTkLabel(frame, text=titulo[:80], font=("Segoe UI", 12, "bold"),
-                     text_color=TEXT, wraplength=300).pack(padx=12, pady=(10, 6), anchor="w")
+                     text_color=COLORS["TEXT"], wraplength=300).pack(padx=12, pady=(10, 6), anchor="w")
         # Creador + fecha
         cid = str(p.get("user") or "")
         svc = str(p.get("service") or "")
@@ -1698,9 +2099,9 @@ class SiteWindow(ctk.CTkToplevel):
         counts = pawchive_api.count_by_type_list(p)
         info = f"{creador}  •  {fecha}  •  {svc}"
         info += f"  •  🖼 {counts['imagen']}  🎬 {counts['video']}  📁 {counts['archivo']}"
-        ctk.CTkLabel(frame, text=info, font=("Segoe UI", 11), text_color=MUTED).pack(padx=12, anchor="w")
+        ctk.CTkLabel(frame, text=info, font=("Segoe UI", 11), text_color=COLORS["MUTED"]).pack(padx=12, anchor="w")
         # Separador
-        ctk.CTkFrame(frame, height=1, fg_color=BORDER).pack(fill="x", padx=8, pady=6)
+        ctk.CTkFrame(frame, height=1, fg_color=COLORS["BORDER"]).pack(fill="x", padx=8, pady=6)
         # Archivos (lista)
         archivos = pawchive_api.all_files(pawchive_api.fetch_post(svc, cid, str(p.get("id"))))
         if archivos:
@@ -1708,14 +2109,14 @@ class SiteWindow(ctk.CTkToplevel):
                 icon = {"imagen": "🖼", "video": "🎬", "archivo": "📁"}.get(a["tipo"], "📄")
                 name = a["nombre"][:50]
                 ctk.CTkLabel(frame, text=f"{icon}  {name}", font=("Segoe UI", 11),
-                             text_color=TEXT, anchor="w").pack(padx=12, pady=1, anchor="w", fill="x")
+                             text_color=COLORS["TEXT"], anchor="w").pack(padx=12, pady=1, anchor="w", fill="x")
             if len(archivos) > 12:
                 ctk.CTkLabel(frame, text=f"... y {len(archivos) - 12} más",
-                             font=("Segoe UI", 10), text_color=MUTED).pack(padx=12, pady=2, anchor="w")
+                             font=("Segoe UI", 10), text_color=COLORS["MUTED"]).pack(padx=12, pady=2, anchor="w")
         else:
             ctk.CTkLabel(frame, text="(sin archivos accesibles)", font=("Segoe UI", 11),
-                         text_color=MUTED).pack(padx=12, pady=4, anchor="w")
-        ctk.CTkFrame(frame, height=1, fg_color=BORDER).pack(fill="x", padx=8, pady=6)
+                         text_color=COLORS["MUTED"]).pack(padx=12, pady=4, anchor="w")
+        ctk.CTkFrame(frame, height=1, fg_color=COLORS["BORDER"]).pack(fill="x", padx=8, pady=6)
         # Botón abrir en web
         ctk.CTkButton(frame, text=" Abrir en pawchive", height=28, font=("Segoe UI", 11),
                       fg_color="#3a3a3a", hover_color="#4a4a4a",
@@ -1776,7 +2177,7 @@ class SiteWindow(ctk.CTkToplevel):
         self.lbl_pch_pag.configure(text="Página 0")
         self.btn_pch_prev.configure(state="disabled")
         self.btn_pch_next.configure(state="disabled")
-        self.lbl_pch_posts.configure(text="—", text_color=MUTED)
+        self.lbl_pch_posts.configure(text="—", text_color=COLORS["MUTED"])
         self._pch_sel_posts()
 
     def _pch_importar(self):
@@ -1799,7 +2200,7 @@ class SiteWindow(ctk.CTkToplevel):
         self._pch_busy = True
         _set_loading(self.btn_pch_imp, True, " Importar seleccionados a la BD")
         self.lbl_pch_imp.configure(
-            text=f"\u23f3 Importando 0/{len(sel)}\u2026", text_color=WARN)
+            text=f"\u23f3 Importando 0/{len(sel)}\u2026", text_color=COLORS["WARN"])
         self.log(f"\U0001f43e Importando {len(sel)} post(s) "
                  "seleccionados a la BD\u2026")
         threading.Thread(target=pch_importar_posts,
@@ -1814,7 +2215,7 @@ class SiteWindow(ctk.CTkToplevel):
         _set_loading(self.btn_pch_imp, False, " Importar seleccionados a la BD")
         if stats.get("error"):
             self.lbl_pch_imp.configure(text=f"\u274c {stats['error']}",
-                                       text_color=DANGER)
+                                       text_color=COLORS["DANGER"])
             self.log(f"[X] Importaci\u00f3n fallida: {stats['error']}")
         else:
             resumen = (f"\u2705 {stats['nuevos']} nuevos \u00b7 "
@@ -1825,7 +2226,7 @@ class SiteWindow(ctk.CTkToplevel):
             ok = stats["nuevos"] or stats["existentes"]
             self.lbl_pch_imp.configure(
                 text=resumen,
-                text_color=SUCCESS if ok and not stats["errores"] else WARN)
+                text_color=COLORS["SUCCESS"] if ok and not stats["errores"] else COLORS["WARN"])
             self.log(f"\U0001f43e Importaci\u00f3n: {resumen}",
                      "ok" if not stats["errores"] else None)
             for f in stats.get("fallos", [])[:8]:
@@ -1836,9 +2237,11 @@ class SiteWindow(ctk.CTkToplevel):
 
     # ---------------- BASE DE DATOS ----------------
     def _db(self):
-        return mysql.connector.connect(**DB)
+        return mysql.connector.connect(**DB_CONFIG)
 
     def refresh_table(self):
+        if not hasattr(self, "tree"):
+            return          # la pestaña Colección aún no está construida
         try:
             conn = self._db()
             cur = conn.cursor()
@@ -1934,6 +2337,8 @@ class SiteWindow(ctk.CTkToplevel):
 
     def fill_table(self):
         """Filtra + ordena `all_rows` y pinta el primer bloque de filas."""
+        if not hasattr(self, "tree"):
+            return          # la pestaña Colección aún no está construida
         # Cancela el debounce pendiente (si vino de una tecla, se cancela el
         # timer; si vino del propio timer, after_cancel es inofensivo)
         if self._fill_after is not None:
@@ -2032,6 +2437,8 @@ class SiteWindow(ctk.CTkToplevel):
 
     def _update_empty(self):
         """Muestra u oculta el panel centrado según el estado de la tabla."""
+        if not hasattr(self, "empty"):
+            return          # la pestaña Colección aún no está construida
         if self._db_ok is False and not self.all_rows:
             icon, title, hint = ("❌", "Sin conexión con MySQL",
                                  "¿Está XAMPP activo? Pulsa para reintentar.")
@@ -2165,7 +2572,7 @@ class SiteWindow(ctk.CTkToplevel):
         if self.dash:
             self.dash.set_busy(True)
         self.btn_stop.configure(state="normal")
-        self.status_dot.configure(text_color=ACCENT)
+        self.status_dot.configure(text_color=COLORS["ACCENT"])
 
         threading.Thread(target=self._reader, daemon=True).start()
         self._refresh_tick()
@@ -2200,10 +2607,10 @@ class SiteWindow(ctk.CTkToplevel):
             pass
         if busy:
             self.status_var.set(f"⏳ Trabajo en otra ventana: {name}")
-            self.status_dot.configure(text_color=WARN)
+            self.status_dot.configure(text_color=COLORS["WARN"])
         else:
             self.status_var.set("Listo")
-            self.status_dot.configure(text_color=MUTED)
+            self.status_dot.configure(text_color=COLORS["MUTED"])
 
     def external_job_done(self):
         """Al terminar el trabajo de OTRA ventana: estado + tabla + hist."""
@@ -2250,7 +2657,7 @@ class SiteWindow(ctk.CTkToplevel):
         ctk.CTkLabel(dlg,
                      text="https://pawchive.pw/patreon/user/12345   ·   "
                           "https://pawchive.pw/fanbox/user/67890",
-                     font=("Segoe UI", 12), text_color=MUTED).pack(
+                     font=("Segoe UI", 12), text_color=COLORS["MUTED"]).pack(
             anchor="w", padx=14)
         box = ctk.CTkTextbox(dlg, font=("Segoe UI", 13))
         box.pack(fill="both", expand=True, padx=14, pady=(8, 8))
@@ -2287,8 +2694,8 @@ class SiteWindow(ctk.CTkToplevel):
         bar = ctk.CTkFrame(dlg, fg_color="transparent")
         bar.pack(fill="x", padx=14, pady=(0, 14))
         ctk.CTkButton(bar, text="\U0001f4be Guardar", width=140, height=34,
-                      font=("Segoe UI", 13), fg_color=ACCENT,
-                      hover_color=ACCENT_HOVER,
+                      font=("Segoe UI", 13), fg_color=COLORS["ACCENT"],
+                      hover_color=COLORS["ACCENT_HOVER"],
                       command=guardar).pack(side="right", padx=(8, 0))
         ctk.CTkButton(bar, text="Cancelar", width=110, height=34,
                       font=("Segoe UI", 13), fg_color="#3a3a3a",
@@ -2298,21 +2705,21 @@ class SiteWindow(ctk.CTkToplevel):
 
     def run_verify(self):
         """🎞 Verificar disco: 'descargado' solo si el cómic está completo en disco."""
-        dest = self.dest_var.get().strip().strip('"') or DEFAULT_DEST
+        dest = self.dest_var.get().strip().strip('"') or str(DEFAULT_DEST)
         args = ["verify_dl.py", "--sync-estado", "--dest", dest]
         self._start_job(args, "Verificar disco (estado según disco)",
                         determinate=False)
 
     def run_optimizer(self):
         """🗜 Optimizar imágenes: re-codifica a q82 en el mismo archivo."""
-        dest = self.dest_var.get().strip().strip('"') or DEFAULT_DEST
+        dest = self.dest_var.get().strip().strip('"') or str(DEFAULT_DEST)
         args = ["optimize.py", "--dest", dest]
         self._start_job(args, "Optimizar imágenes (q82)",
                         determinate=False)
 
     def run_downloader(self, types: str = "imagen,video,archivo"):
         args = ["download.py", "--no-prompt",
-                "--dest", self.dest_var.get().strip().strip('"') or DEFAULT_DEST]
+                "--dest", self.dest_var.get().strip().strip('"') or str(DEFAULT_DEST)]
         try:
             args += ["--workers", str(max(1, int(self.workers_var.get())))]
         except ValueError:
@@ -2384,7 +2791,7 @@ class SiteWindow(ctk.CTkToplevel):
         self.proc = None
         self.btn_stop.configure(state="disabled")
         self.status_dot.configure(
-            text_color=SUCCESS if code == 0 else DANGER)
+            text_color=COLORS["SUCCESS"] if code == 0 else COLORS["DANGER"])
         if self.dash:
             self.dash.set_busy(False)
             self.dash.job_finished(self.job_name, code, dur)
@@ -2413,7 +2820,7 @@ class SiteWindow(ctk.CTkToplevel):
             self._save_settings()
 
     def open_dest(self):
-        path = self.dest_var.get().strip() or DEFAULT_DEST
+        path = self.dest_var.get().strip() or str(DEFAULT_DEST)
         os.makedirs(path, exist_ok=True)
         os.startfile(path)
 
@@ -2434,7 +2841,7 @@ class SiteWindow(ctk.CTkToplevel):
 
     def _comic_folder(self, row: tuple) -> Path:
         _cid, titulo, _estado, sitio = row[0], row[1], row[2], row[3]
-        return carpeta_comic(self.dest_var.get().strip() or DEFAULT_DEST,
+        return carpeta_comic(self.dest_var.get().strip() or str(DEFAULT_DEST),
                              sitio, titulo)
 
     def _open_selected(self, _event=None):
@@ -2485,9 +2892,9 @@ class SiteWindow(ctk.CTkToplevel):
         if n:
             self.lbl_sel.configure(
                 text=f"{n} seleccionado{'s' if n != 1 else ''}",
-                text_color=ACCENT)
+                text_color=COLORS["ACCENT"])
         else:
-            self.lbl_sel.configure(text="Sin selección", text_color=MUTED)
+            self.lbl_sel.configure(text="Sin selección", text_color=COLORS["MUTED"])
 
     def _sel_open_folder(self):
         rows = self._selected_rows()
@@ -2627,5 +3034,5 @@ if __name__ == "__main__":
     launcher = Launcher()
     print("Lanzador iniciado — ventanas: "
           "📕 VerComicsPorno / 📗 VerMangasPorno / 🐾 Pawchive")
-    print(f"Base de datos: {DB['database']} @ {DB['host']}")
+    print(f"Base de datos: {DB_CONFIG['database']} @ {DB_CONFIG['host']}")
     launcher.mainloop()

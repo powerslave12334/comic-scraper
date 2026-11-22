@@ -236,10 +236,10 @@ python gui.py     # o gui.bat
 
 - **🚀 Lanzador** (`Launcher`): botones 📕 VerComicsPorno / 📗 VerMangasPorno /
   🐾 Pawchive con el recuento de cómics de cada sitio (hilo de fondo),
-  estado del trabajo global, botón ⏻ Cerrar todo. **Recuerda qué ventanas
-  estaban abiertas** (`open_windows` en `gui_config.json`) y las reabre al
-  arrancar; cada ventana recuerda además su geometría (`geo_vcp` /
-  `geo_vmp` / `geo_pch`).
+  estado del trabajo global, botón ⏻ Cerrar todo. **Arranca sin abrir
+  ninguna ventana de sitio**: las ventanas se abren al pulsar su botón (y
+  cada una recuerda la geometría con la que se cerró la última vez,
+  `geo_vcp` / `geo_vmp` / `geo_pch`).
 - **Ventana por sitio** (`SiteWindow`, `CTkToplevel`): cada ventana es de UN
   sitio — **sin selector ni filtro de sitio** (columna Sitio oculta), con
   sus dos pestañas (Pawchive añade una tercera, 🐾 Explorar):
@@ -261,8 +261,17 @@ Pestaña con **dos paneles**; todo va por la API JSON de `pawchive_api.py`
     sola vez** y se guarda en **`pawchive_index_cache.json`** (≈4,3 MB);
     después todo el filtrado es local. La etiqueta muestra el recuento y la
     fecha; el botón 🔄 vuelve a descargarlo (el arranque usa la caché si
-    existe). Se pintan como mucho **1.500 filas** (`PCH_IDX_MAX`), ordenadas
-    por popularidad (`favorited` ↓).
+    existe, y la carga se hace **en un hilo aparte**: la ventana no se
+    congela). Se pintan como mucho **1.500 artistas** (`PCH_IDX_MAX`),
+    ordenados por popularidad (`favorited` ↓).
+  - **Grid de tarjetas (4 columnas)**: cada artista es una tarjeta de
+    180×220 px con su **avatar** y un **overlay negro** dentro con el
+    **nombre** (en negrita) y la línea **`servicio · id`**. El grid está
+    **virtualizado**: del índice completo solo se crean las tarjetas que
+    caben en el viewport (24 de 99.348 con el índice completo), al hacer
+    scroll se recrean las que entran en pantalla y el `scrollregion` mantiene
+    la altura real del índice. La **selección sobrevive al reciclado** (se
+    guarda por índice, no por widget).
   - **Filtros**: búsqueda por **nombre o id** (debounce de 300 ms),
     desplegable de **servicio** (Todos / Patreon / Fanbox / Discord) y
     casilla **★ Solo mis creadores**.
@@ -270,8 +279,9 @@ Pestaña con **dos paneles**; todo va por la API JSON de `pawchive_api.py`
     **➖ Quitar**: escriben `pawchive_creators.json` (la lista que usa
     `scraper.py --site pch` para sincronizar) y actualizan el botón
     🐾 Creadores del Dashboard.
-  - **Clic en un artista** → carga **sus posts** en el panel derecho (ver
-    *modo creador* abajo); **doble clic** abre su perfil en el navegador.
+  - **Clic en un artista** → lo selecciona y carga **sus posts** en el panel
+    derecho (ver *modo creador* abajo); **doble clic** abre su perfil en el
+    navegador. Con **Ctrl/Clic** se añade a la selección.
 - **🔍 Buscador de posts (derecha)**
   - `GET /api/v1/posts?q=…&service=…&o=…` con **búsqueda real** (si la
     consulta está vacía lista los posts recientes), filtro de servicio y
@@ -299,6 +309,41 @@ Pestaña con **dos paneles**; todo va por la API JSON de `pawchive_api.py`
     (`estado='pendiente'`): las imágenes se descargan después desde
     **📚 Colección** con el botón de descarga normal. Los posts solo-vídeo
     se cuentan como *sin imágenes*.
+
+### Arranque rápido (sin congelones)
+
+La ventana de sitio se abre **por fases**, para que el usuario la vea al
+instante y la interfaz no se quede quieta:
+
+| Fase | Cuándo | Qué hace |
+|---|---|---|
+| 1 | `open_site()` | Tabla de pestañas, panel Explorar y barra inferior (el Dashboard muestra un ⏳ *Cargando…*) |
+| 2 | al pintarse la ventana (`<Map>`) | Dashboard, construido **por pasos** (tarjetas → gráfico → controles → info → registro), cediendo el control a Tk entre paso y paso |
+| 3 | al terminar la fase 2 | Pestaña Colección y primera carga de filas de la BD |
+
+- `update_idletasks()` se **acota** durante la construcción: customtkinter
+  lo llama en cada `_draw` de optionmenu/scrollbar y cada repaso drenaba
+  **toda** la maquetación pendiente (~1 s de congelón por ventana).
+- Se corta la **recursión** `CTkScrollbar._draw` → `canvas.update_idletasks()`
+  → `<Configure>` → otro `_draw` (era la causa del congelón final de ~2,5 s).
+- El **índice de artistas** (4,1 MB) se lee y deserializa **en un hilo
+  aparte**; la GUI solo consume la lista ya en memoria.
+- El **grid de artistas** está virtualizado: solo se crean las tarjetas
+  visibles (24 de 99.348), así que no hay 99.348 widgets que crear.
+
+Medido en este equipo con el **mainloop real** (la misma forma en que se
+mide la respuesta de la app; con un `update()` en bucle los números salen
+inflados porque Tk drena todos los eventos pendientes de golpe):
+
+| Sitio | `open_site()` | Ventana visible | Congelón máximo |
+|---|---|---|---|
+| VerComicsPorno | 90-440 ms | ~300 ms | ~345 ms |
+| VerMangasPorno | 60-430 ms | ~250 ms | ~370 ms |
+| Pawchive | 240-450 ms | ~300 ms | ~190 ms |
+
+> Antes de estos cambios la misma apertura tardaba **3,4 s** con la ventana
+> congelada y el "congelón" final reachaba **2,5 s** (recursión de
+> `CTkScrollbar._draw`).
 
 ### Trabajos globales (solo UNO a la vez)
 

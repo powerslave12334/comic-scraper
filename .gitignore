@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# Entornos
+.venv/
+venv/
+env/
+
+# Configuración local / runtime
+scripts/gui_config.json
+scripts/craft.json
+scripts/feed.json
+scripts/usage.json
+scripts/build-activity.log
+scripts/inbox/
+scripts/investigation.cany/
+scripts/.browser-profile/
+scripts/brave_cookies.json
+scripts/cf_cache.json
+
+# Datos generados
+scripts/pawchive_index_cache.json
+scripts/pawchive_thumbs/
+scripts/optimize_manifest.json
+scripts/jobs_history.json
+scripts/pawchive_creators.json
+scripts/.pawchive_creators.json
+
+# Herramientas
+.opencode/
+.playwright-mcp/
+opencode.json
+
+# Sistema
+Thumbs.db
+desktop.ini
+*.log

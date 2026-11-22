@@ -12,7 +12,6 @@ Si falta alguno -> 'pendiente'. Los 'duplicado' nunca se tocan.
 import argparse
 import json
 import sys
-from collections import defaultdict
 from pathlib import Path
 
 try:
@@ -24,9 +23,8 @@ except Exception:
 import mysql.connector
 
 import download
-
-SCRIPT_DIR = Path(__file__).resolve().parent
-
+from config import SCRIPT_DIR, DB_CONFIG
+from db import PageRepository
 
 def destino_por_defecto() -> str:
     """Destino guardado por la GUI (gui_config.json) o J:/comics."""
@@ -50,7 +48,7 @@ def main() -> int:
     download.OUT_DIR = Path(args.dest or destino_por_defecto()).expanduser()
     print(f'Carpeta destino: "{download.OUT_DIR}"')
 
-    conn = mysql.connector.connect(**download.DB)
+    conn = mysql.connector.connect(**DB_CONFIG)
     cur = conn.cursor()
     cur.execute("""
         SELECT c.id, c.titulo, c.sitio, c.estado
@@ -58,10 +56,8 @@ def main() -> int:
     """)
     comics = cur.fetchall()
 
-    cur.execute("SELECT comic_id, numero, url_imagen FROM paginas")
-    esperado = defaultdict(set)
-    for comic_id, numero, url in cur.fetchall():
-        esperado[comic_id].add(download.esperado_de_fila(numero, url))
+    # Usar repositorio para obtener archivos esperados
+    esperado = PageRepository.expected_files()
 
     sin_carpeta = []
     vacias = []

@@ -53,66 +53,46 @@ except Exception:
 import customtkinter as ctk
 import tkinter as tk
 
+from config import (
+    SCRIPT_DIR, SITES, MODE_VALUES, ESTADO_FILTROS, INVALID_CHARS,
+    COLORS, SITE_ACCENTS, DEFAULT_DEST,
+)
+from db import ComicRepository, TagRepository, PageRepository, connection  # noqa: F401
+from exceptions import DatabaseError  # noqa: F401
+
+# SITES / ESTADO_FILTROS / SITE_ACCENTS se re-exportan desde aquí:
+# gui.py y otros módulos los importan de dashboard (compatibilidad).
+__all_reexports__ = (SITES, ESTADO_FILTROS, SITE_ACCENTS)
+
 # -------------- CONFIGURACIÓN COMPARTIDA (la usa gui.py) --------------
-SCRIPT_DIR = Path(__file__).resolve().parent
 CONFIG_FILE = SCRIPT_DIR / "gui_config.json"
 JOBS_FILE = SCRIPT_DIR / "jobs_history.json"
 
-DB = {
-    "user": "root",
-    "password": "",
-    "host": "127.0.0.1",
-    "database": "mis_comics",
-}
-DEFAULT_DEST = "C:\\Comics"
-
 # Motor de scraping ofrecido en la interfaz
 MODE_LABELS = ("Auto (cookies de Brave)", "HTTP rápido (sin navegador)", "Solo navegador")
-MODE_VALUES = {
-    "Auto (cookies de Brave)": "auto",
-    "HTTP rápido (sin navegador)": "http",
-    "Solo navegador": "browser",
-}
-
-# Sitios ofrecidos en la interfaz (coinciden con scraper.py --site)
-SITE_LABELS = ("VerComicsPorno", "VerMangasPorno", "Pawchive", "Ambos")
-SITE_VALUES = {"VerComicsPorno": "vcp", "VerMangasPorno": "vmp",
-               "Pawchive": "pch", "Ambos": "all"}
-
-# Una VENTANA por sitio (gui.py): código -> etiqueta visible, nombre en
-# la BD (comics.sitio) e icono del lanzador.
-SITES = {
-    "vcp": {"label": "VerComicsPorno", "sitio": "vercomicsporno",
-            "icon": "\U0001f4d8"},
-    "vmp": {"label": "VerMangasPorno", "sitio": "vermangasporno",
-            "icon": "\U0001f4d9"},
-    "pch": {"label": "Pawchive", "sitio": "pawchive",
-            "icon": "\U0001f43e"},
-}
 
 # Filtros de la tabla principal (gui.py)
 SITIO_FILTROS = ("Todos", "vercomicsporno", "vermangasporno", "pawchive")
-ESTADO_FILTROS = ("Todos", "pendiente", "descargado", "duplicado")
 
 RE_PROGRESS = re.compile(r"progreso:\s*(\d+)/(\d+)")
 
-# Colores
-BG = "#141414"
-PANEL = "#1e1e1e"
-CARD_BG = "#242424"
-BORDER = "#2e2e2e"
-ACCENT = "#3b82f6"           # azul (acento principal)
-ACCENT_HOVER = "#2563eb"
-SUCCESS = "#22c55e"          # verde: descargado / OK
-WARN = "#f59e0b"             # ámbar: pendiente / aviso
-DANGER = "#ef4444"           # rojo: error
-ORANGE = "#fb923c"           # naranja: duplicado
-CYAN = "#38bdf8"             # cian: URLs de páginas
-PURPLE = "#a78bfa"           # violeta: etiquetas
-TEXT = "#e8e8e8"
-MUTED = "#9a9a9a"
+# Colores (desde config)
+BG = COLORS["BG"]
+PANEL = COLORS["PANEL"]
+CARD_BG = COLORS["CARD_BG"]
+BORDER = COLORS["BORDER"]
+ACCENT = COLORS["ACCENT"]
+ACCENT_HOVER = COLORS["ACCENT_HOVER"]
+SUCCESS = COLORS["SUCCESS"]
+WARN = COLORS["WARN"]
+DANGER = COLORS["DANGER"]
+ORANGE = COLORS["ORANGE"]
+CYAN = COLORS["CYAN"]
+PURPLE = COLORS["PURPLE"]
+TEXT = COLORS["TEXT"]
+MUTED = COLORS["MUTED"]
 
-INVALID = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+INVALID = re.compile(INVALID_CHARS)
 
 
 def blend(color: str, bg: str, t: float = 0.2) -> str:
@@ -199,7 +179,7 @@ def classify_line(line: str):
 class Dashboard(ctk.CTkFrame):
     """Pestaña del dashboard: estadísticas, sistema, controles, historial y log."""
 
-    def __init__(self, master, app):
+    def __init__(self, master, app, auto=True):
         super().__init__(master, fg_color=BG, corner_radius=0)
         self.app = app
 
@@ -208,24 +188,48 @@ class Dashboard(ctk.CTkFrame):
         self._mysql_ok = None          # None = aún sin comprobar
         self.jobs: list[dict] = self._load_jobs()
         self._meta_rows: dict = {}     # sitio -> (label, bar, pct)
+        self._built = False
 
-        self._build()
-        self._load_cache()
-        self.refresh_stats()
-        self.after(5000, self._tick)
+        if auto:
+            self.construir()
 
     # ---------------- CONSTRUCCIÓN ----------------
-    def _build(self):
-        font = ("Segoe UI", 13)
-        small = ("Segoe UI", 12)
+    def construir(self):
+        """Construye el dashboard entero de una sola vez."""
+        for paso in self.pasos_build():
+            paso()
+        self._built = True
 
-        # --- Contenido superior con scroll (tarjetas + cuerpo) ---
-        # En ventanas bajas el panel izquierdo no cabe entero: se desplaza
-        # en vez de recortarse. El registro queda fijo debajo.
+    def pasos_build(self):
+        """Pasos de construcción, troceados.
+
+        El dashboard tiene ~90 widgets; crearlos todos de golpe congela la
+        ventana casi un segundo.gui.py va llamando a estos pasos de uno en
+        uno (con `after`) para que Tk repinte entre medias."""
+        yield self._paso_scroll
+        yield self._paso_cartas
+        yield self._paso_grafico
+        yield self._paso_cuerpo
+        yield self._paso_scraping
+        yield self._paso_descarga
+        yield self._paso_utilidades
+        yield self._paso_info
+        yield self._paso_log
+        yield self._paso_final
+
+    def _build(self):
+        """Construcción completa de una vez (compatibilidad)."""
+        self.construir()
+
+    # --- Paso 1: marco con scroll ---
+    def _paso_scroll(self):
         scroll = ctk.CTkScrollableFrame(self, fg_color=BG, corner_radius=0)
         scroll.pack(fill="both", expand=True)
+        self._scroll = scroll
 
-        # --- 1. Tarjetas de estadísticas (elevadas con sombra) ---
+    # --- Paso 2: tarjetas de estadísticas (elevadas con sombra) ---
+    def _paso_cartas(self):
+        scroll = self._scroll
         cards = ctk.CTkFrame(scroll, fg_color="transparent")
         cards.pack(fill="x", padx=16, pady=(12, 8))
         for i in range(6):
@@ -265,7 +269,10 @@ class Dashboard(ctk.CTkFrame):
             val.pack(anchor="w", padx=12, pady=(4, 10))
             self._card_vals[key] = val
 
-        # --- Gráfico: descargas de los últimos 14 días ---
+    # --- Paso 3: gráfico de descargas de los últimos 14 días ---
+    def _paso_grafico(self):
+        small = ("Segoe UI", 12)
+        scroll = self._scroll
         chart_sec = ctk.CTkFrame(scroll, fg_color=PANEL, corner_radius=10)
         chart_sec.pack(fill="x", padx=16, pady=(0, 8))
         ch_hdr = ctk.CTkFrame(chart_sec, fg_color="transparent")
@@ -281,18 +288,35 @@ class Dashboard(ctk.CTkFrame):
         self._chart_body.pack(fill="x", padx=14, pady=(6, 12))
         self._chart_data = None      # últimos datos dibujados (evita repintar)
 
-        # --- Cuerpo: izquierda (controles) / derecha (info) ---
+    # --- Paso 4: cuerpo (columna de controles / columna de info) ---
+    def _paso_cuerpo(self):
+        scroll = self._scroll
         body = ctk.CTkFrame(scroll, fg_color="transparent")
         body.pack(fill="both", expand=True, padx=16, pady=(0, 4))
+        # Columna 0 = ancho fijo del panel de controles (384 px);
+        # columna 1 = info, ocupa el resto.
+        body.grid_columnconfigure(0, weight=0, minsize=384)
+        body.grid_columnconfigure(1, weight=1)
+        body.grid_rowconfigure(0, weight=1)
 
-        left = ctk.CTkFrame(body, fg_color="transparent", width=384)
-        left.pack(side="left", fill="y", padx=(0, 12))
-        left.pack_propagate(False)
+        left = ctk.CTkFrame(body, fg_color="transparent")
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, 12))
+        # OJO: sin pack_propagate(False). Con él, el panel declaraba un alto
+        # de 0 y el packer repartía el espacio de la ventana entre las 3
+        # secciones: "Descarga" y "Utilidades" quedaban aplastadas a 1x1 y el
+        # botón "Descargar" era invisible.
 
         right = ctk.CTkFrame(body, fg_color="transparent")
-        right.pack(side="left", fill="both", expand=True)
+        right.grid(row=0, column=1, sticky="nsew")
+        self._body = body
+        self._left = left
+        self._right = right
 
-        # --- 4. Controles agrupados: Scraping ---
+    # --- Paso 5: controles de Scraping ---
+    def _paso_scraping(self):
+        font = ("Segoe UI", 13)
+        small = ("Segoe UI", 12)
+        left = self._left
         s1 = self._section(left, "\U0001f504 Scraping")
         sitio = getattr(self.app, "site", "vcp")
         if sitio == "pch":
@@ -306,7 +330,7 @@ class Dashboard(ctk.CTkFrame):
                          font=("Segoe UI", 12)).pack(side="right")
         else:
             self._opt_row(s1, "Motor de scraping", self.app.mode_var,
-                          list(MODE_LABELS), 210)
+                          list(MODE_VALUES.keys()), 210)
         # Sitio fijo de esta ventana (una ventana por sitio)
         r = ctk.CTkFrame(s1, fg_color="transparent")
         r.pack(fill="x", pady=(0, 6))
@@ -352,7 +376,11 @@ class Dashboard(ctk.CTkFrame):
                 command=self.app.edit_pawchive_creators)
             self.btn_creators.pack(fill="x", pady=(8, 0))
 
-        # --- 4. Controles agrupados: Descarga ---
+    # --- Paso 6: controles de Descarga ---
+    def _paso_descarga(self):
+        font = ("Segoe UI", 13)
+        small = ("Segoe UI", 12)
+        left = self._left
         s2 = self._section(left, "\u2b07\ufe0f Descarga")
         ctk.CTkLabel(s2, text="Carpeta destino", font=small,
                      text_color=MUTED).pack(anchor="w")
@@ -389,7 +417,10 @@ class Dashboard(ctk.CTkFrame):
             command=self.app.stop_job)
         self.btn_stop.pack(fill="x")
 
-        # --- 4. Controles agrupados: Utilidades ---
+    # --- Paso 7: controles de Utilidades ---
+    def _paso_utilidades(self):
+        small = ("Segoe UI", 12)
+        left = self._left
         s3 = self._section(left, "\U0001f527 Utilidades")
         ctk.CTkButton(s3, text="\U0001f4c1  Abrir carpeta destino", height=34,
                       font=small, fg_color="#3a3a3a", hover_color="#4a4a4a",
@@ -413,7 +444,10 @@ class Dashboard(ctk.CTkFrame):
                       hover_color="#4a4a4a",
                       command=self.refresh_stats).pack(fill="x")
 
-        # --- 2. Progreso de metadatos del sitio ---
+    # --- Paso 8: panel derecho (metadatos, estado e historial) ---
+    def _paso_info(self):
+        right = self._right
+        # --- Progreso de metadatos del sitio ---
         s4 = self._section(right, "\U0001f4c8 Metadatos del sitio")
         self.meta_body = ctk.CTkFrame(s4, fg_color="transparent")
         self.meta_body.pack(fill="x")
@@ -448,7 +482,9 @@ class Dashboard(ctk.CTkFrame):
         self.hist_box.tag_config("err", foreground="#ff6b6b")
         self._render_jobs()
 
-        # --- 6. Registro de actividad (mejorado; fijo abajo, siempre visible) ---
+    # --- Paso 9: registro de actividad (fijo abajo, siempre visible) ---
+    def _paso_log(self):
+        small = ("Segoe UI", 12)
         logf = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=10, height=206)
         logf.pack(fill="x", padx=16, pady=(4, 10))
         logf.pack_propagate(False)
@@ -473,6 +509,13 @@ class Dashboard(ctk.CTkFrame):
         self.log_box.tag_config("ok", foreground="#7bd88f")
         self.log_box.tag_config("prog", foreground="#6bd6ff")
         self.log_box.tag_config("head", foreground="#a78bfa")
+
+    # --- Paso 10: datos iniciales (BD) y temporizador ---
+    def _paso_final(self):
+        self._built = True
+        self._load_cache()
+        self.refresh_stats()
+        self.after(5000, self._tick)
 
     def _section(self, parent, title):
         f = ctk.CTkFrame(parent, fg_color=PANEL, corner_radius=10)
@@ -514,12 +557,14 @@ class Dashboard(ctk.CTkFrame):
     # ---------------- EVENTOS DESDE SiteWindow (gui.py) ----------------
     def set_busy(self, busy: bool):
         state = "disabled" if busy else "normal"
-        self.btn_sync.configure(state=state)
-        self.btn_backfill.configure(state=state)
-        self.btn_dl.configure(state=state)
-        self.btn_verify.configure(state=state)
-        self.btn_opt.configure(state=state)
-        self.btn_stop.configure(state="normal" if busy else "disabled")
+        for nom in ("btn_sync", "btn_backfill", "btn_dl", "btn_verify",
+                    "btn_opt"):
+            btn = getattr(self, nom, None)
+            if btn is not None:
+                btn.configure(state=state)
+        btn_stop = getattr(self, "btn_stop", None)
+        if btn_stop is not None:
+            btn_stop.configure(state="normal" if busy else "disabled")
 
     def job_finished(self, name: str, code: int, dur: str):
         self.jobs.append({
@@ -547,19 +592,22 @@ class Dashboard(ctk.CTkFrame):
     def log(self, text: str, tag: str | None = None):
         if not text or not self.winfo_exists():
             return
+        log_box = getattr(self, "log_box", None)
+        if log_box is None:
+            return          # dashboard aún en construcción
         if tag is None:
             tag = classify_line(text)
         ts = time.strftime("%H:%M:%S")
-        self.log_box.configure(state="normal")
-        self.log_box.insert("end", f"[{ts}] ", "ts")
+        log_box.configure(state="normal")
+        log_box.insert("end", f"[{ts}] ", "ts")
         if tag:
-            self.log_box.insert("end", text + "\n", tag)
+            log_box.insert("end", text + "\n", tag)
         else:
-            self.log_box.insert("end", text + "\n")
-        content = self.log_box.get("1.0", "end").splitlines()
+            log_box.insert("end", text + "\n")
+        content = log_box.get("1.0", "end").splitlines()
         if len(content) > 600:
-            self.log_box.delete("1.0", f"{len(content) - 600}.0")
-        self.log_box.see("end")
+            log_box.delete("1.0", f"{len(content) - 600}.0")
+        log_box.see("end")
         self.log_box.configure(state="disabled")
 
     def clear_log(self):
@@ -578,6 +626,8 @@ class Dashboard(ctk.CTkFrame):
 
     # ---------------- ESTADÍSTICAS ----------------
     def refresh_stats(self):
+        if not self._built:
+            return          # dashboard aún en construcción
         stats = self.app.fetch_stats()
         if not stats or not stats.get("ok"):
             err = (stats or {}).get("error", "sin datos")
@@ -654,11 +704,11 @@ class Dashboard(ctk.CTkFrame):
             w.destroy()
         total = sum(serie)
         self.lbl_chart_sum.configure(
-            text=f"{fmt_num(total)} cómics" if total else "sin actividad")
+            text=f"{fmt_num(total)} c\u00f3mics" if total else "sin actividad")
         if total == 0:
             ctk.CTkLabel(self._chart_body,
-                         text="\U0001f4ed Sin descargas en los últimos "
-                              "14 días",
+                         text="\U0001f4ed Sin descargas en los \u00faltimos "
+                              "14 d\u00edas",
                          font=("Segoe UI", 12), text_color=MUTED,
                          height=84).pack(fill="x")
             return
@@ -693,19 +743,22 @@ class Dashboard(ctk.CTkFrame):
                 anchor="center", pady=(2, 0))
 
     def _render_jobs(self):
-        self.hist_box.configure(state="normal")
-        self.hist_box.delete("1.0", "end")
+        hist_box = getattr(self, "hist_box", None)
+        if hist_box is None:
+            return          # dashboard aún en construcción
+        hist_box.configure(state="normal")
+        hist_box.delete("1.0", "end")
         if not self.jobs:
-            self.hist_box.insert("end", "Sin trabajos a\u00fan en esta sesi\u00f3n.\n")
+            hist_box.insert("end", "Sin trabajos a\u00fan en esta sesi\u00f3n.\n")
         for j in reversed(self.jobs):
             ok = j.get("code") == 0
             icon = "\u2705" if ok else "\u274c"
             extra = "" if ok else f" \u2014 error {j.get('code')}"
             line = (f"{j.get('t', '')}  {icon} {j.get('name', '')}  "
                     f"\u2014 {j.get('dur', '?')}{extra}\n")
-            self.hist_box.insert("end", line, "ok" if ok else "err")
-        self.hist_box.see("1.0")
-        self.hist_box.configure(state="disabled")
+            hist_box.insert("end", line, "ok" if ok else "err")
+        hist_box.see("1.0")
+        hist_box.configure(state="disabled")
 
     # ---------------- SISTEMA ----------------
     def _tick(self):
@@ -778,8 +831,9 @@ class Dashboard(ctk.CTkFrame):
     def _load_cache(self):
         """Muestra el último escaneo conocido de la colección."""
         scan = load_config().get("disk_scan")
-        if scan:
-            self.lbl_coll.configure(
+        lbl = getattr(self, "lbl_coll", None)
+        if scan and lbl is not None:
+            lbl.configure(
                 text=f"\U0001f4c1 {fmt_num(scan.get('files', 0))} archivos \u00b7 "
                      f"{fmt_bytes(scan.get('bytes', 0))}  ({scan.get('at', '?')})")
 

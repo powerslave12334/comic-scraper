@@ -34,8 +34,9 @@ except Exception:
 
 from PIL import Image, ImageOps
 
-SCRIPT_DIR = Path(__file__).resolve().parent
-CONFIG_FILE = SCRIPT_DIR / "gui_config.json"
+from config import SCRIPT_DIR, JPEG_QUALITY, MIN_SIZE_BYTES, OPTIMIZE_WORKERS
+from exceptions import OptimizationError, UnsupportedFormatError  # noqa: F401
+
 MANIFEST_NAME = "optimize_manifest.json"
 IMG_EXTS = {".jpg", ".jpeg", ".png"}
 
@@ -43,7 +44,7 @@ IMG_EXTS = {".jpg", ".jpeg", ".png"}
 def destino_por_defecto() -> str:
     """Destino guardado por la GUI (gui_config.json)."""
     try:
-        cfg = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        cfg = json.loads((SCRIPT_DIR / "gui_config.json").read_text(encoding="utf-8"))
         if cfg.get("dest"):
             return cfg["dest"]
     except Exception:
@@ -228,11 +229,11 @@ def main() -> int:
         description="Optimiza imágenes en disco (mismo nombre, q82 JPEG)")
     parser.add_argument("--dest", default=None,
                         help="Carpeta destino (por defecto, gui_config.json)")
-    parser.add_argument("--quality", type=int, default=82,
+    parser.add_argument("--quality", type=int, default=JPEG_QUALITY,
                         help="Calidad JPEG (por defecto 82)")
-    parser.add_argument("--min-size", type=int, default=200 * 1024,
+    parser.add_argument("--min-size", type=int, default=MIN_SIZE_BYTES,
                         help="Ignora archivos menores que N bytes (def. 200KB)")
-    parser.add_argument("--workers", type=int, default=4,
+    parser.add_argument("--workers", type=int, default=OPTIMIZE_WORKERS,
                         help="Hilos de optimización")
     parser.add_argument("--limit", type=int, default=None,
                         help="Máximo de archivos (para pruebas)")

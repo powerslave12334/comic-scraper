@@ -23,18 +23,23 @@ la parte con BD vive en scraper.py (scrape_pawchive_*).
 """
 import csv
 import hashlib
-import io
 import json
 import re
 import time
 from pathlib import Path
 
+import brave_cf
+from config import PCH_PAUSE, PCH_MAX_RETRIES, PCH_IDX_MAX, SCRIPT_DIR
+from exceptions import PawchiveApiError
+
 API = "https://pawchive.pw/api/v1"
 WEB = "https://pawchive.pw"
 IMG = "https://img.pawchive.pw"   # nodo de miniaturas y archivos
-CREATORS_FILE = Path(__file__).resolve().parent / "pawchive_creators.json"
-PAUSA = 0.3           # pausa entre peticiones (educada; sin límite documentado)
-RE_INTENTOS = 3
+CREATORS_FILE = SCRIPT_DIR / "pawchive_creators.json"
+
+PAUSA = PCH_PAUSE           # pausa entre peticiones (educada; sin límite documentado)
+RE_INTENTOS = PCH_MAX_RETRIES
+PCH_IDX_MAX_ROWS = PCH_IDX_MAX
 IMG_EXTS = (".jpg", ".jpeg", ".png", ".webp", ".gif")
 
 RE_CREATOR = re.compile(
@@ -102,9 +107,8 @@ def fetch_json(rel: str, intentos: int = RE_INTENTOS):
 
     Pausa PAUSA tras cada éxito y reintenta con espera creciente ante
     errores de red/HTTP; los errores de la API ({"error": ...}) NO se
-    reintentan. Lanza RuntimeError si sigue fallando.
+    reintentan. Lanza PawchiveApiError si sigue fallando.
     """
-    import brave_cf   # import perezoso: solo hace falta al descargar
     url = rel if rel.startswith("http") else API + rel
     ultimo = None
     for intento in range(intentos):
@@ -124,9 +128,9 @@ def fetch_json(rel: str, intentos: int = RE_INTENTOS):
             continue
         time.sleep(PAUSA)
         if isinstance(datos, dict) and datos.get("error"):
-            raise RuntimeError(f"API: {datos['error']} ({url})")
+            raise PawchiveApiError(datos['error'], endpoint=url)
         return datos
-    raise RuntimeError(f"Fallo al consultar {url}: {ultimo}")
+    raise PawchiveApiError(f"Fallo al consultar {url}: {ultimo}", endpoint=url)
 
 
 def fetch_profile(service: str, cid: str) -> dict:
@@ -327,7 +331,6 @@ def norm_title(titulo: str) -> str:
 
 # -------------- MINIATURAS --------------
 
-SCRIPT_DIR = Path(__file__).resolve().parent
 THUMB_DIR = SCRIPT_DIR / "pawchive_thumbs"
 
 
@@ -363,7 +366,6 @@ def thumb_post_url(post: dict) -> str | None:
 
 def fetch_thumb(url: str, timeout: int = 45) -> bytes:
     """Descarga una miniatura (sin leer la BD de Brave)."""
-    import brave_cf   # import perezoso
     return brave_cf.fetch_image(url, timeout=timeout)
 
 

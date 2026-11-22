@@ -19,7 +19,9 @@ CREATE TABLE IF NOT EXISTS comics (
   sitio VARCHAR(30) NOT NULL DEFAULT 'vercomicsporno' COMMENT 'vercomicsporno | vermangasporno | pawchive',
   estado ENUM('pendiente','descargado','duplicado') DEFAULT 'pendiente',
   UNIQUE KEY uq_url (url_comic),
-  KEY idx_sitio (sitio)
+  KEY idx_sitio (sitio),
+  KEY idx_estado_sitio (estado, sitio),
+  KEY idx_fecha_descarga (fecha_descarga)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 -- Tags/etiquetas de cada comic (pp-taglist)
@@ -44,6 +46,15 @@ CREATE TABLE IF NOT EXISTS paginas (
   comic_id INT NOT NULL,
   numero INT NOT NULL,
   url_imagen TEXT NOT NULL,
+  tipo ENUM('imagen','video','archivo') DEFAULT 'imagen' COMMENT 'Tipo de archivo',
   FOREIGN KEY (comic_id) REFERENCES comics(id) ON DELETE CASCADE,
-  UNIQUE KEY uq_comic_pagina (comic_id,numero)
+  UNIQUE KEY uq_comic_pagina (comic_id, numero)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- Índices adicionales para consultas frecuentes.
+-- OJO: MySQL no admite "CREATE INDEX IF NOT EXISTS" (eso es de MariaDB),
+-- así que se dejan comentados; ejecútalos SOLO si tu servidor no los tiene
+-- ya (SHOW INDEX FROM comics;). Con el "CREATE TABLE IF NOT EXISTS" de
+-- arriba no hacen falta en una instalación nueva.
+-- CREATE INDEX idx_paginas_comic_numero ON paginas(comic_id, numero);
+-- CREATE INDEX idx_comics_titulo_norm ON comics((LOWER(TRIM(REPLACE(REPLACE(titulo, '\r', ''), '\n', '')))));
