@@ -20,7 +20,7 @@
 
 ### Grid de artistas paginado (pestaña 🐾 Explorar)
 
-- Grid de **3×3 = 9 tarjetas por página** (180×220): avatar + banda con el
+- Grid de **3×3 = 9 tarjetas por página** (170×210): avatar + banda con el
   **nombre** y **`servicio · id`**.
 - Barra de paginación: **‹ Anterior**, **Página X de Y**, **Siguiente ›** y
   salto directo a una página (1.500 artistas = 167 páginas).
@@ -31,6 +31,30 @@
 - El panel de artistas y el de posts se reparten con **grid** (no con
   `pack`): el Treeview de posts ya no se come el ancho y las **3 columnas**
   de tarjetas caben enteras (antes la 3ª quedaba cortada).
+
+### Posts como tarjetas paginadas (pestaña 🐾 Explorar)
+
+- El buscador de posts deja de ser un **Treeview** (tabla de 50 filas) y
+  pasa a un **grid de 3×3 = 9 tarjetas por página**, igual que los
+  artistas: portada, **título**, **creador · fecha** y
+  **servicio · 🖼 n 🎬 n 📁 n**.
+- Barra de paginación: **‹ Anterior**, **Página X de Y**, **Siguiente ›** y
+  salto directo. La API sigue entregando bloques de **50** posts (`o=50`),
+  pero en pantalla solo se pintan 9: al llegar al final de un bloque se
+  pide el siguiente a la API y la numeración de página continúa (pág. 7 de
+  12, …). El salto directo también cambia de bloque si hace falta.
+- **Selección por clic** (marcar/desmarcar) con la acumulación entre
+  páginas intacta; **Todo** marca los de la página actual, **Limpiar**
+  vacía todo. **Doble clic** abre el post en el navegador.
+- **Portadas recortadas al tamaño real de la tarjeta**: la imagen se guarda
+  cuadrada en la caché y se recorta (`ImageOps.fit`) al ancho/alto de la
+  etiqueta, así **llena la tarjeta sin deformarse**; si no hay portada se
+  ve la inicial del título.
+- El **preview** al pasar el ratón (detalle del post + lista de archivos) se
+  pide **en un hilo**: antes se hacía en el hilo principal y congelaba la
+  ventana mientras arrive la respuesta de la API.
+- La caché de portadas tiene **versión propia** (`p2:`) para no mezclar los
+  PNG antiguos (con fondo gris) con los nuevos (recorte cuadrado).
 
 ### Miniaturas: por qué no se veían (y arreglo)
 
@@ -68,6 +92,11 @@
 - `test_paginacion.py` (nuevo): 19/19 — 9 tarjetas por página, 3 páginas,
   botones y salto directo, la selección sobrevive al cambio de página y la
   **miniatura real se pinta** (red + caché en disco).
+- `test_posts_cards.py` (nuevo): 32/32 — 9 tarjetas de posts por página
+  (3×3), paginación local dentro del bloque de 50, salto directo (incluido
+  el cambio de bloque), selección por clic que **acumula entre páginas**,
+  **Todo**, portada real pintada (red + caché en disco), preview flotante
+  al pasar el ratón y borde de acento en la tarjeta seleccionada.
 - `test_gap.py` mide el congelón **con el mainloop real** (con un `update()`
   en bucle el número sale inflado ~10×: artefacto de la medición).
 - Estado final de la BD tras la batería: 11.157 vcp + 9.185 vmp,

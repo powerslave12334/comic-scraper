@@ -87,6 +87,11 @@ PCH_INDEX_FILE = SCRIPT_DIR / "pawchive_index_cache.json"
 PCH_IDX_MAX = 1500          # artistas máx. en la lista filtrada
 PCH_ART_POR_PAGINA = 9      # tarjetas de artistas por página (3x3)
 PCH_ART_COLS = 3            # columnas del grid de artistas
+PCH_POST_POR_PAGINA = 9     # tarjetas de posts por página (3x3)
+PCH_POST_COLS = 3           # columnas del grid de posts
+PCH_POST_LOTE = 50          # posts que devuelve la API por petición (o=50)
+# Páginas de tarjetas que tiene un bloque completo de 50 posts
+PCH_POST_PAGS_BLOQUE = -(-PCH_POST_LOTE // PCH_POST_POR_PAGINA)   # = 6
 PCH_SVC_LABELS = {"Todos": "", "Patreon": "patreon",
                   "Fanbox": "fanbox", "Discord": "discord"}
 
@@ -659,8 +664,12 @@ class SiteWindow(ctk.CTkToplevel):
         self._pch_idx: list = []         # (id, nombre, servicio, fav) por fav↓
         self._pch_nom: dict = {}         # (servicio, id) -> nombre
         self._pch_view: list = []        # [(servicio, id, nombre)] en la lista
-        self._pch_posts: list = []       # posts de la página actual
-        self._pch_page = 0
+        self._pch_posts: list = []       # posts del bloque actual (hasta 50)
+        self._pch_page = 0               # bloque del servidor (o = page*50)
+        self._pch_post_pag = 0           # página local (0-based) del bloque
+        self._pch_post_pags = 1          # páginas locales del bloque actual
+        self._pch_post_objetivo = None   # página local a la que saltar
+        self.pch_post_cards: dict = {}   # idx local -> datos de la tarjeta
         self._pch_busy = False           # cargando índice/posts/importando
         self._pch_idx_loading = False    # leyendo caché del índice (hilo)
         self._pch_art_after = None       # debounce de la búsqueda de artistas
@@ -674,6 +683,7 @@ class SiteWindow(ctk.CTkToplevel):
         # ---- miniaturas (avatares artistas + thumbs posts) ----
         self._pch_thumb_imgs: dict[str, tk.PhotoImage] = {}  # clave -> imagen
         self._pch_thumb_ctk: dict[str, ctk.CTkImage] = {}     # clave -> CTkImage
+        self._pch_thumb_pil: dict = {}                         # clave -> imagen PIL
         self._pch_thumb_sizes: dict[str, tuple[int, int]] = {}
         self._pch_thumb_pending: dict[str, list[str]] = {}   # clave -> iids
         self._pch_thumb_pendientes: set[str] = set()         # descargas en curso
@@ -1231,59 +1241,48 @@ class SiteWindow(ctk.CTkToplevel):
         self.btn_pch_buscar.pack(side="right", padx=(8, 0))
         _add_tooltip(self.btn_pch_buscar, "Buscar posts")
 
-        tbl = ctk.CTkFrame(de, fg_color="#1a1a1a", corner_radius=8)
-        tbl.pack(fill="both", expand=True, padx=12, pady=(2, 6))
-        cols = ("titulo", "creador", "fecha", "servicio", "img", "vid", "arc")
-        self.pch_tree = ttk.Treeview(
-            tbl, columns=cols, show="tree headings", style="PchPost.Treeview",
-            selectmode="extended")
-        self.pch_tree.heading("#0", text="")
-        self.pch_tree.column("#0", width=56, minwidth=56,
-                             stretch=False, anchor="center")
-        for c, txt, w, a in (("titulo", "Título", 400, "w"),
-                             ("creador", "Creador", 170, "w"),
-                             ("fecha", "Fecha", 82, "center"),
-                             ("servicio", "Servicio", 82, "center"),
-                             ("img", "Img", 46, "center"),
-                             ("vid", "Vid", 46, "center"),
-                             ("arc", "Arc", 46, "center")):
-            self.pch_tree.heading(c, text=txt)
-            self.pch_tree.column(c, width=w, minwidth=45, anchor=a)
-        self.pch_tree.tag_configure("odd", background="#1a1a1a")
-        self.pch_tree.tag_configure("even", background="#202020")
-        sb_p = ttk.Scrollbar(tbl, orient="vertical",
-                             style="Dark.Vertical.TScrollbar",
-                             command=self.pch_tree.yview)
-        self.pch_tree.configure(yscrollcommand=sb_p.set)
-        self.pch_tree.pack(side="left", fill="both", expand=True,
-                           padx=(8, 0), pady=8)
-        sb_p.pack(side="right", fill="y", padx=(0, 8), pady=8)
+        # Grid de posts como TARJETAS (3x3) paginadas, igual que los
+        # artistas: solo se crean 9 tarjetas a la vez -> la ventana responde
+        # al instante y no hay que hacer scroll por 50 filas.
+        self.pch_posts_frame = ctk.CTkScrollableFrame(
+            de, fg_color="#1a1a1a", corner_radius=8,
+            label_text="", label_font=("Segoe UI", 12))
+        self.pch_posts_frame.pack(fill="both", expand=True, padx=12, pady=(2, 4))
+        self.pch_posts_frame._scrollbar.configure(width=8)
+        for c in range(PCH_POST_COLS):
+            self.pch_posts_frame.grid_columnconfigure(c, weight=1, minsize=170)
 
+        # ---- barra de paginación de posts ----
         pag = ctk.CTkFrame(de, fg_color="transparent")
         pag.pack(fill="x", padx=12, pady=(0, 6))
-        self.btn_pch_prev = ctk.CTkButton(
-            pag, text=" Anterior", width=100, height=30, font=small,
+        self.btn_pch_post_prev = ctk.CTkButton(
+            pag, text="‹ Anterior", width=92, height=28, font=small,
             fg_color="#3a3a3a", hover_color="#4a4a4a", state="disabled",
-            image=_load_icon("chevron-left.svg", (16, 16)), compound="left",
-            command=lambda: self._pch_buscar(self._pch_page - 1))
-        self.btn_pch_prev.pack(side="left")
-        _add_tooltip(self.btn_pch_prev, "Página anterior")
-        self.lbl_pch_pag = ctk.CTkLabel(pag, text="Página 0", font=small,
-                                        text_color=COLORS["MUTED"], width=90)
-        self.lbl_pch_pag.pack(side="left", padx=6)
-        self.btn_pch_next = ctk.CTkButton(
-            pag, text="Siguiente ", width=100, height=30, font=small,
+            command=lambda: self._pch_post_cambiar_pagina(-1))
+        self.btn_pch_post_prev.pack(side="left")
+        _add_tooltip(self.btn_pch_post_prev, "Página anterior")
+        self.lbl_pch_post_pag = ctk.CTkLabel(
+            pag, text="Página 1 de 1", font=small, text_color=COLORS["MUTED"])
+        self.lbl_pch_post_pag.pack(side="left", expand=True, padx=6)
+        self.btn_pch_post_next = ctk.CTkButton(
+            pag, text="Siguiente ›", width=92, height=28, font=small,
             fg_color="#3a3a3a", hover_color="#4a4a4a", state="disabled",
-            image=_load_icon("chevron-left.svg", (16, 16)), compound="right",
-            command=lambda: self._pch_buscar(self._pch_page + 1))
-        self.btn_pch_next.pack(side="left")
-        _add_tooltip(self.btn_pch_next, "Página siguiente")
+            command=lambda: self._pch_post_cambiar_pagina(1))
+        self.btn_pch_post_next.pack(side="right")
+        _add_tooltip(self.btn_pch_post_next, "Página siguiente")
+        # Salto directo a una página
+        self.pch_entry_post_pag = ctk.CTkEntry(
+            pag, width=52, height=28, font=small, placeholder_text="nº")
+        self.pch_entry_post_pag.pack(side="right", padx=(6, 0))
+        self.pch_entry_post_pag.bind("<Return>",
+                                     lambda _e: self._pch_post_ir_a_pagina())
+        _add_tooltip(self.pch_entry_post_pag, "Ir a la página (y Enter)")
         btn_todo = ctk.CTkButton(pag, text=" Todo", width=70, height=30,
                       font=small, fg_color="#3a3a3a", hover_color="#4a4a4a",
                       image=_load_icon("plus.svg", (16, 16)), compound="left",
                       command=self._pch_todo_posts)
         btn_todo.pack(side="right", padx=(6, 0))
-        _add_tooltip(btn_todo, "Seleccionar todos")
+        _add_tooltip(btn_todo, "Seleccionar todos los de la página")
         btn_limpiar = ctk.CTkButton(pag, text=" Limpiar", width=90, height=30,
                       font=small, fg_color="#3a3a3a", hover_color="#4a4a4a",
                       image=_load_icon("trash.svg", (16, 16)), compound="left",
@@ -1339,12 +1338,12 @@ class SiteWindow(ctk.CTkToplevel):
                                 lambda _e: self._pch_schedule_art())
         self.pch_svc_var.trace_add(
             "write", lambda *_: self._pch_fill_artistas())
-        # Preview panel en hover (para posts)
-        self.pch_tree.bind("<Motion>", self._pch_on_tree_motion)
-        self.pch_tree.bind("<Leave>", self._pch_hide_preview)
+        # Preview panel en hover (para posts): se enlaza en cada tarjeta
         self._pch_preview_win = None
         self._pch_preview_idx = None
         self._pch_preview_after = None
+        self._pch_preview_card = None
+        self._pch_preview_busy: set[int] = set()
 
     # ---- cola de mensajes (hilo de fondo -> UI) ----
     def _pch_poll(self):
@@ -1366,6 +1365,9 @@ class SiteWindow(ctk.CTkToplevel):
             self._pch_thumb_listo(m[1], m[2])
         elif tipo == "thumb_err":
             self._pch_thumb_error(m[1], m[2])
+        elif tipo == "preview":
+            # detalle del post listo -> se pinta el preview (hilo principal)
+            self._pch_crear_preview(m[1], m[2])
         elif tipo == "idx_err":
             self._pch_busy = False
             self._pch_idx_loading = False
@@ -1376,6 +1378,7 @@ class SiteWindow(ctk.CTkToplevel):
             self._pch_fill_posts(m[1], m[2])
         elif tipo == "posts_err":
             self._pch_busy = False
+            self._pch_post_objetivo = None
             self.btn_pch_buscar.configure(state="normal")
             self.lbl_pch_posts.configure(text=f"\u274c {m[1]}",
                                          text_color=COLORS["DANGER"])
@@ -1850,7 +1853,7 @@ class SiteWindow(ctk.CTkToplevel):
             params = []
             if q:
                 params.append("q=" + quote(q))
-            params.append("o=" + str(page * 50))
+            params.append("o=" + str(page * PCH_POST_LOTE))
             rel = f"/{svc}/user/{cid}?" + "&".join(params)
         else:
             self.lbl_pch_posts.configure(
@@ -1862,7 +1865,7 @@ class SiteWindow(ctk.CTkToplevel):
                 params.append("q=" + quote(q))
             if svc:
                 params.append("service=" + svc)
-            params.append("o=" + str(page * 50))
+            params.append("o=" + str(page * PCH_POST_LOTE))
             rel = "/posts?" + "&".join(params)
         threading.Thread(target=self._pch_posts_worker,
                          args=(page, rel), daemon=True).start()
@@ -1876,43 +1879,225 @@ class SiteWindow(ctk.CTkToplevel):
             self._pch_q.put(("posts_err", str(e)))
 
     def _pch_fill_posts(self, page, posts):
+        """Llega un bloque de posts (hasta 50) del servidor -> se pintan sus
+        tarjetas por páginas de 9."""
         self._pch_busy = False
         self._pch_posts = posts
         self._pch_page = page
         _set_loading(self.btn_pch_buscar, False, " Buscar")
-        tree = self.pch_tree
-        tree.delete(*tree.get_children())
-        for i, p in enumerate(posts):
-            cid = str(p.get("user") or "")
-            svc = str(p.get("service") or "")
-            creador = self._pch_nom.get((svc, cid), cid)
-            titulo = (str(p.get("title") or "").strip()
-                      or f"post {p.get('id')}")
-            fecha = str(p.get("published") or "")[:10]
-            counts = pawchive_api.count_by_type_list(p)
-            clave = f"post:{svc}:{cid}:{p.get('id')}"
-            ph = self._pch_thumb_imgs.get(clave)
-            kw = {"iid": str(i), "values": (titulo, creador, fecha, svc,
-                                           counts["imagen"], counts["video"], counts["archivo"]),
-                  "tags": ("odd" if i % 2 else "even",)}
-            if ph is not None:
-                kw["image"] = ph
-            tree.insert("", "end", **kw)
-        self.lbl_pch_pag.configure(text=f"Página {page + 1}")
-        self.btn_pch_prev.configure(
-            state="normal" if page > 0 else "disabled")
-        self.btn_pch_next.configure(
-            state="normal" if len(posts) >= 50 else "disabled")
         self.lbl_pch_posts.configure(
             text=f"{len(posts)} posts", text_color=COLORS["MUTED"])
-        # Re-marca en el árbol los que ya estaban seleccionados en otra
-        # página (la selección se acumula: _pch_acum es la fuente de verdad)
-        previos = [str(i) for i, p in enumerate(posts)
-                   if str(p.get("id")) in self._pch_acum]
-        if previos:
-            tree.selection_set(previos)
+        # ¿veníamos de un salto a una página concreta?
+        objetivo = self._pch_post_objetivo
+        self._pch_post_objetivo = None
+        if objetivo is None:
+            self._pch_post_pag = 0      # bloque nuevo -> primera página local
+        self._pch_render_posts(objetivo)
+
+    # ---------------- PAGINACIÓN DEL GRID DE POSTS ----------------
+    def _pch_render_posts(self, objetivo=None):
+        """Pinta las 9 tarjetas de posts de la página local actual.
+
+        `objetivo` = página local (0-based) a la que saltar; si es None se
+        respeta la página actual."""
+        frame = getattr(self, "pch_posts_frame", None)
+        if frame is None or not frame.winfo_exists():
+            return
+        with _ui_rapida():
+            self._pch_render_posts_raw(objetivo)
+
+    def _pch_render_posts_raw(self, objetivo=None):
+        frame = self.pch_posts_frame
+        for widget in frame.winfo_children():
+            widget.destroy()
+        self.pch_post_cards.clear()
+
+        total = len(self._pch_posts)
+        self._pch_post_pags = max(1, -(-total // PCH_POST_POR_PAGINA))
+        if objetivo is not None:
+            if objetivo < 0:
+                # -1 = última página del bloque (al retroceder de bloque)
+                self._pch_post_pag = self._pch_post_pags - 1
+            else:
+                self._pch_post_pag = max(0, min(int(objetivo),
+                                                self._pch_post_pags - 1))
+        else:
+            self._pch_post_pag = max(0, min(self._pch_post_pag,
+                                            self._pch_post_pags - 1))
+
+        ini = self._pch_post_pag * PCH_POST_POR_PAGINA
+        fin = min(ini + PCH_POST_POR_PAGINA, total)
+        for k, idx in enumerate(range(ini, fin)):
+            self._create_post_card(idx, self._pch_posts[idx],
+                                   k // PCH_POST_COLS, k % PCH_POST_COLS)
+
+        # Barra de paginación: numeración global (bloque*6 + local)
+        num = self._pch_page * PCH_POST_PAGS_BLOQUE + self._pch_post_pag + 1
+        total_pags = self._pch_page * PCH_POST_PAGS_BLOQUE + self._pch_post_pags
+        if total == 0:
+            self.lbl_pch_post_pag.configure(text="—")
+        else:
+            self.lbl_pch_post_pag.configure(
+                text=f"Página {num} de {total_pags}")
+        hay_mas = (self._pch_post_pag < self._pch_post_pags - 1
+                   or len(self._pch_posts) >= PCH_POST_LOTE)
+        self.btn_pch_post_prev.configure(
+            state="normal" if (self._pch_post_pag > 0
+                               or self._pch_page > 0) else "disabled")
+        self.btn_pch_post_next.configure(
+            state="normal" if hay_mas else "disabled")
+
         self._pch_sel_posts()
         self._pch_descargar_posts_faltantes()
+
+    def _pch_post_cambiar_pagina(self, delta: int):
+        """Avanza o retrocede páginas de tarjetas de posts.
+
+        Al llegar al final de un bloque se pide el siguiente bloque al
+        servidor (la API devuelve 50 posts por petición)."""
+        if self._pch_busy:
+            return
+        if delta > 0:
+            if self._pch_post_pag + 1 < self._pch_post_pags:
+                self._pch_post_pag += 1
+                self._pch_render_posts()
+                return
+            if len(self._pch_posts) >= PCH_POST_LOTE:
+                self._pch_post_objetivo = 0
+                self._pch_buscar(self._pch_page + 1)
+            return
+        # delta < 0
+        if self._pch_post_pag > 0:
+            self._pch_post_pag -= 1
+            self._pch_render_posts()
+            return
+        if self._pch_page > 0:
+            self._pch_post_objetivo = -1      # última página del bloque
+            self._pch_buscar(self._pch_page - 1)
+
+    def _pch_post_ir_a_pagina(self):
+        """Salta a la página escrita en el campo (Enter)."""
+        try:
+            n = int(self.pch_entry_post_pag.get().strip())
+        except Exception:
+            return
+        if n < 1:
+            return
+        bloque = (n - 1) // PCH_POST_PAGS_BLOQUE
+        local = (n - 1) % PCH_POST_PAGS_BLOQUE
+        self.pch_entry_post_pag.delete(0, "end")
+        if bloque == self._pch_page:
+            self._pch_post_pag = local
+            self._pch_render_posts()
+            return
+        self._pch_post_objetivo = local
+        self._pch_buscar(bloque)
+
+    def _create_post_card(self, idx, post, row, col):
+        """Crea una tarjeta de post en el grid (3x3)."""
+        svc = str(post.get("service") or "")
+        cid = str(post.get("user") or "")
+        pid = str(post.get("id") or "")
+        clave = f"post:{svc}:{cid}:{pid}"
+        titulo = (str(post.get("title") or "").strip() or f"post {pid}")
+        creador = self._pch_nom.get((svc, cid), cid)
+        fecha = str(post.get("published") or "")[:10]
+        counts = pawchive_api.count_by_type_list(post)
+        ph = self._pch_thumb_ctk.get(clave) or self._pch_thumb_imgs.get(clave)
+
+        card = ctk.CTkFrame(
+            self.pch_posts_frame, fg_color="#222222", corner_radius=10,
+            border_width=2, border_color="#333333", width=170, height=230)
+        card.grid(row=row, column=col, padx=8, pady=8, sticky="nsew")
+        card.grid_propagate(False)
+        card.grid_columnconfigure(0, weight=1)
+        card.grid_rowconfigure(0, weight=1)   # la imagen toma el alto libre
+
+        # Portada del post (si no hay miniatura: la inicial del título)
+        img_label = ctk.CTkLabel(
+            card, text=("" if ph is not None else (titulo[:1] or "?")),
+            image=ph, text_color="#555555",
+            font=("Segoe UI", 30, "bold"))
+        img_label.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
+
+        # Banda de información
+        overlay = ctk.CTkFrame(card, fg_color="#111111", corner_radius=8)
+        overlay.grid(row=1, column=0, sticky="ew", padx=4, pady=(0, 4))
+        overlay.grid_columnconfigure(0, weight=1)
+
+        title_label = ctk.CTkLabel(
+            overlay, text=titulo[:60], font=("Segoe UI", 12, "bold"),
+            text_color="white", wraplength=150, justify="left",
+            anchor="w")
+        title_label.grid(row=0, column=0, padx=8, pady=(6, 0), sticky="ew")
+
+        info_label = ctk.CTkLabel(
+            overlay, text=f"{creador[:18]} · {fecha}",
+            font=("Segoe UI", 10), text_color="#cccccc", anchor="w")
+        info_label.grid(row=1, column=0, padx=8, pady=(0, 0), sticky="ew")
+
+        counts_label = ctk.CTkLabel(
+            overlay,
+            text=(f"{svc} · 🖼{counts['imagen']}  🎬{counts['video']}"
+                  f"  📁{counts['archivo']}"),
+            font=("Segoe UI", 10), text_color="#9a9a9a", anchor="w")
+        counts_label.grid(row=2, column=0, padx=8, pady=(0, 6), sticky="ew")
+
+        self.pch_post_cards[idx] = {
+            "frame": card,
+            "img_label": img_label,
+            "overlay": overlay,
+            "title_label": title_label,
+            "info_label": info_label,
+            "counts_label": counts_label,
+            "service": svc,
+            "cid": cid,
+            "pid": pid,
+            "titulo": titulo,
+            "selected": pid in self._pch_acum,
+        }
+        for w in (card, img_label, overlay, title_label, info_label,
+                  counts_label):
+            w.bind("<Button-1>", lambda e, i=idx: self._pch_post_click(i))
+            w.bind("<Double-1>", lambda e, i=idx: self._pch_open_post(i))
+            w.bind("<Motion>", lambda e, i=idx: self._pch_on_post_motion(i))
+            w.bind("<Leave>", self._pch_hide_preview)
+        # La portada se recorta al tamaño real de la tarjeta (al redimensionar)
+        img_label.bind("<Configure>",
+                       lambda e, i=idx: self._pch_post_ajustar_imagen(i))
+
+        # Descargar la portada si falta (en hilo aparte)
+        if clave not in self._pch_thumb_imgs:
+            url = pawchive_api.thumb_post_url(post)
+            if url:
+                self._pch_bajar_thumb(clave, url, 150, 150)
+
+    def _pch_post_click(self, idx):
+        """Clic en una tarjeta de post -> la marca/desmarca para importar."""
+        if idx not in self.pch_post_cards:
+            return
+        card = self.pch_post_cards[idx]
+        pid = card["pid"]
+        if pid in self._pch_acum:
+            self._pch_acum.pop(pid, None)
+        else:
+            self._pch_acum[pid] = self._pch_posts[idx]
+        self._pch_sel_posts()
+
+    def _pch_post_style(self, idx):
+        """Pinta el estilo de la tarjeta según esté seleccionada o no."""
+        if idx not in self.pch_post_cards:
+            return
+        card = self.pch_post_cards[idx]
+        sel = card["pid"] in self._pch_acum
+        card["selected"] = sel
+        if sel:
+            card["frame"].configure(border_color=COLORS["ACCENT"],
+                                    border_width=3)
+            card["overlay"].configure(fg_color=COLORS["ACCENT"])
+        else:
+            card["frame"].configure(border_color="#333333", border_width=2)
+            card["overlay"].configure(fg_color="#111111")
 
     # ---- descarga de miniaturas (avatares artistas + thumbs posts) ----
     def _pch_descargar_artistas_faltantes(self, out):
@@ -1925,16 +2110,17 @@ class SiteWindow(ctk.CTkToplevel):
             self._pch_bajar_thumb(clave, url, 172, 172)
 
     def _pch_descargar_posts_faltantes(self):
-        """Dispara la descarga en segundo plano de las miniaturas de posts
+        """Dispara la descarga en segundo plano de las portadas de los posts
         que faltan en la página actual."""
-        for idx in range(len(self._pch_posts)):
-            p = self._pch_posts[idx]
-            clave = f"post:{p.get('service')}:{p.get('user')}:{p.get('id')}"
+        for idx, card in self.pch_post_cards.items():
+            clave = f"post:{card['service']}:{card['cid']}:{card['pid']}"
             if clave in self._pch_thumb_imgs:
                 continue
-            url = pawchive_api.thumb_post_url(p)
+            if not (0 <= idx < len(self._pch_posts)):
+                continue
+            url = pawchive_api.thumb_post_url(self._pch_posts[idx])
             if url:
-                self._pch_bajar_thumb(clave, url, 48, 64)
+                self._pch_bajar_thumb(clave, url, 150, 150)
 
     def _pch_bajar_thumb(self, clave, url, w, h):
         """Pide una miniatura: primero la caché en disco, si no, la red.
@@ -1992,18 +2178,31 @@ class SiteWindow(ctk.CTkToplevel):
     def _pch_thumb_preparar(clave: str, url: str, w: int, h: int) -> bytes:
         """Descarga la miniatura, la recorta y la devuelve como PNG.
 
-        Solo trabaja con Pillow (sin Tk): se puede ejecutar en un hilo."""
+        Solo trabaja con Pillow (sin Tk): se puede ejecutar en un hilo.
+
+        - Creadores: se ajustan en un cuadrado con fondo (el avatar se ve
+          completo).
+        - Posts: se guardan como cuadrado SIN fondo (recorte de la portada);
+          el ajuste al ancho real de la tarjeta se hace al pintarla, para
+          que la imagen llene la tarjeta sin deformarse.
+        """
         from PIL import Image, ImageOps   # PIL es dependencia del proyecto
         datos = pawchive_api.fetch_thumb(url, timeout=30)
         img = Image.open(io.BytesIO(datos)).convert("RGB")
         img = ImageOps.exif_transpose(img) or img
-        img.thumbnail((w, h))
-        fondo = Image.new("RGB", (w, h), (26, 26, 26))
-        x = (w - img.width) // 2
-        y = (h - img.height) // 2
-        fondo.paste(img, (x, y))
+        if clave.startswith("post:"):
+            lado = max(w, h) * 2
+            img = ImageOps.fit(img, (lado, lado), method=Image.LANCZOS,
+                               centering=(0.5, 0.3))
+        else:
+            img.thumbnail((w, h))
+            fondo = Image.new("RGB", (w, h), (26, 26, 26))
+            x = (w - img.width) // 2
+            y = (h - img.height) // 2
+            fondo.paste(img, (x, y))
+            img = fondo
         buf = io.BytesIO()
-        fondo.save(buf, "PNG")
+        img.save(buf, "PNG")
         png = buf.getvalue()
         # caché en disco: la próxima vez se pinta sin volver a la red
         try:
@@ -2025,18 +2224,17 @@ class SiteWindow(ctk.CTkToplevel):
             return
         with self._pch_thumb_lock:
             self._pch_thumb_imgs[clave] = ph
-        # Las tarjetas usan CTkImage (escala bien en pantallas HiDPI); el
-        # Treeview de posts necesita un PhotoImage normal.
-        if clave.startswith("creator:"):
-            try:
-                from PIL import Image
-                w, h = self._pch_thumb_sizes.get(clave, (172, 172))
-                img = Image.open(io.BytesIO(png)).convert("RGB")
-                with self._pch_thumb_lock:
-                    self._pch_thumb_ctk[clave] = ctk.CTkImage(
-                        light_image=img, dark_image=img, size=(w, h))
-            except Exception as e:
-                self._pch_thumb_error(clave, e)
+        # Las tarjetas usan CTkImage (escala bien en pantallas HiDPI).
+        try:
+            from PIL import Image
+            w, h = self._pch_thumb_sizes.get(clave, (172, 172))
+            img = Image.open(io.BytesIO(png)).convert("RGB")
+            with self._pch_thumb_lock:
+                self._pch_thumb_pil[clave] = img
+                self._pch_thumb_ctk[clave] = ctk.CTkImage(
+                    light_image=img, dark_image=img, size=(w, h))
+        except Exception as e:
+            self._pch_thumb_error(clave, e)
         self._pch_aplicar_thumb(clave)
 
     def _pch_thumb_error(self, clave, e):
@@ -2058,9 +2256,16 @@ class SiteWindow(ctk.CTkToplevel):
                 if card_clave == clave:
                     card_data["img_label"].configure(
                         image=None, text=(card_data["name"][:1] or "?"))
+        elif clave.startswith("post:"):
+            for card_data in self.pch_post_cards.values():
+                card_clave = (f"post:{card_data['service']}:"
+                              f"{card_data['cid']}:{card_data['pid']}")
+                if card_clave == clave:
+                    card_data["img_label"].configure(
+                        image=None, text=(card_data["titulo"][:1] or "?"))
 
     def _pch_aplicar_thumb(self, clave):
-        """Asigna la miniatura ya descargada a las tarjetas/filas que la usan."""
+        """Asigna la miniatura ya descargada a las tarjetas que la usan."""
         ph = self._pch_thumb_imgs.get(clave)
         if ph is None:
             return
@@ -2076,40 +2281,59 @@ class SiteWindow(ctk.CTkToplevel):
                             text="")
                     except Exception:
                         pass        # la tarjeta ya no existe (página cambiada)
-        # Actualizar thumbnails de posts (si existe el tree)
-        if hasattr(self, "pch_tree") and self.pch_tree.winfo_exists():
-            for iid in self.pch_tree.get_children():
-                try:
-                    idx = int(iid)
-                except ValueError:
-                    continue
-                if not (0 <= idx < len(self._pch_posts)):
-                    continue
-                p = self._pch_posts[idx]
-                if f"post:{p.get('service')}:{p.get('user')}:{p.get('id')}" == clave:
-                    try:
-                        self.pch_tree.item(iid, image=ph)
-                    except Exception:
-                        pass
+        # Actualizar portadas de los posts
+        elif clave.startswith("post:"):
+            for idx, card_data in self.pch_post_cards.items():
+                card_clave = (f"post:{card_data['service']}:"
+                              f"{card_data['cid']}:{card_data['pid']}")
+                if card_clave == clave:
+                    self._pch_post_ajustar_imagen(idx)
+
+    def _pch_post_ajustar_imagen(self, idx):
+        """Recorta la portada al tamaño real de la tarjeta (sin deformar).
+
+        La imagen se guarda cuadrada en la caché; aquí se recorta al ancho
+        y alto que tiene la etiqueta, así la portada LLENA la tarjeta."""
+        card = self.pch_post_cards.get(idx)
+        if card is None:
+            return
+        lab = card["img_label"]
+        try:
+            if not lab.winfo_exists():
+                return
+            w = lab.winfo_width()
+            h = lab.winfo_height()
+        except Exception:
+            return
+        if w < 20 or h < 20:
+            return
+        if card.get("img_w") == w and card.get("img_h") == h:
+            return
+        card["img_w"], card["img_h"] = w, h
+        clave = (f"post:{card['service']}:{card['cid']}:{card['pid']}")
+        pil = self._pch_thumb_pil.get(clave)
+        if pil is None:
+            return
+        try:
+            from PIL import ImageOps
+            escala = ctk.ScalingTracker.get_widget_scaling(lab) or 1.0
+            destino = (max(1, int(w / escala)), max(1, int(h / escala)))
+            recortada = ImageOps.fit(pil, destino, method=Image.LANCZOS,
+                                     centering=(0.5, 0.3))
+            ctk_img = ctk.CTkImage(light_image=recortada,
+                                   dark_image=recortada, size=destino)
+            card["ctk"] = ctk_img
+            lab.configure(image=ctk_img, text="")
+        except Exception:
+            pass
 
     def _pch_sel_posts(self, _e=None):
-        """Sincroniza el árbol con la selección ACUMULADA (`_pch_acum`).
+        """Refleja la selección ACUMULADA (`_pch_acum`) en las tarjetas.
 
         `acum` es la fuente de verdad: sobrevive a los cambios de página y
-        de búsqueda; lo que se desmarca en la página actual se quita de
-        `acum`, y lo que está marcado se añade."""
-        sel = set(self.pch_tree.selection())
-        pagina = {}
-        for iid in self.pch_tree.get_children():
-            i = int(iid) if iid.isdigit() else -1
-            if not (0 <= i < len(self._pch_posts)):
-                continue
-            pid = str(self._pch_posts[i].get("id"))
-            if iid in sel:
-                pagina[pid] = self._pch_posts[i]
-            else:
-                self._pch_acum.pop(pid, None)
-        self._pch_acum.update(pagina)
+        de búsqueda (clave: id del post)."""
+        for idx in list(self.pch_post_cards):
+            self._pch_post_style(idx)
         n = len(self._pch_acum)
         self.lbl_pch_imp.configure(
             text="Sin selección" if not n else
@@ -2118,143 +2342,185 @@ class SiteWindow(ctk.CTkToplevel):
         self.btn_pch_imp.configure(
             state="normal" if (n and not self._pch_busy) else "disabled")
 
-    def _pch_open_post(self, event=None):
-        iid = (self.pch_tree.identify_row(event.y)
-               if event is not None else self.pch_tree.focus())
-        if not iid or not iid.isdigit() or int(iid) >= len(self._pch_posts):
+    def _pch_open_post(self, idx):
+        """Doble clic en una tarjeta -> abre el post en el navegador."""
+        if not isinstance(idx, int) or not (0 <= idx < len(self._pch_posts)):
             return
-        p = self._pch_posts[int(iid)]
+        p = self._pch_posts[idx]
         webbrowser.open(pawchive_api.post_url(
             str(p.get("service") or ""), str(p.get("user") or ""),
             str(p.get("id") or "")))
 
-    # ---- Panel de preview flotante (hover en árbol de posts) ----
-    def _pch_on_tree_motion(self, event):
-        """Muestra preview al pasar ratón por una fila."""
-        iid = self.pch_tree.identify_row(event.y)
-        if not iid or not iid.isdigit():
+    # ---- Panel de preview flotante (hover en tarjeta de post) ----
+    def _pch_on_post_motion(self, idx):
+        """Muestra el preview al pasar el ratón por una tarjeta."""
+        if not (0 <= idx < len(self._pch_posts)):
             self._pch_hide_preview()
             return
-        idx = int(iid)
-        if idx >= len(self._pch_posts):
-            self._pch_hide_preview()
-            return
-        if self._pch_preview_idx == idx and self._pch_preview_win and self._pch_preview_win.winfo_exists():
-            return  # ya visible para esta fila
-        # Cancelar timer anterior Y ocultar preview anterior
+        if (self._pch_preview_idx == idx and self._pch_preview_win
+                and self._pch_preview_win.winfo_exists()):
+            return  # ya visible para esta tarjeta
         if self._pch_preview_after:
-            self.after_cancel(self._pch_preview_after)
-        self._pch_hide_preview()  # Asegurar que se destruye el anterior
-        # Mostrar con pequeño delay (150ms) para evitar flicker
-        self._pch_preview_after = self.after(150, lambda: self._pch_show_preview(idx, event))
-
-    def _pch_show_preview(self, idx, event):
-        """Crea y muestra el panel de preview para el post idx."""
-        if idx >= len(self._pch_posts):
-            return
-        # Destruir preview anterior si existe
+            try:
+                self.after_cancel(self._pch_preview_after)
+            except Exception:
+                pass
         self._pch_hide_preview()
+        # El detalle del post se pide en un hilo (la API va lento): la
+        # ventana se pinta en el hilo principal cuando llega la respuesta.
+        self._pch_preview_after = self.after(
+            150, lambda: self._pch_show_preview(idx))
+
+    def _pch_show_preview(self, idx):
+        """Pide el detalle del post (en hilo) y pinta el preview."""
+        if not (0 <= idx < len(self._pch_posts)):
+            return
+        if idx in self._pch_preview_busy:
+            return          # ya hay una petición en curso para esta tarjeta
         p = self._pch_posts[idx]
+        svc = str(p.get("service") or "")
+        cid = str(p.get("user") or "")
+        pid = str(p.get("id") or "")
         self._pch_preview_idx = idx
-        # Crear ventana flotante
-        self._pch_preview_win = ctk.CTkToplevel(self)
-        self._pch_preview_win.wm_overrideredirect(True)
-        self._pch_preview_win.attributes("-topmost", True)
-        self._pch_preview_win.configure(fg_color=COLORS["CARD_BG"])
-        # Contenido
-        frame = ctk.CTkFrame(self._pch_preview_win, fg_color=COLORS["CARD_BG"], corner_radius=8,
+        self._pch_preview_busy.add(idx)
+        threading.Thread(target=self._pch_preview_worker,
+                         args=(idx, svc, cid, pid), daemon=True).start()
+
+    def _pch_preview_worker(self, idx, svc, cid, pid):
+        """Hilo: descarga el detalle del post (nada de Tk aquí)."""
+        try:
+            detalle = pawchive_api.fetch_post(svc, cid, pid)
+            archivos = pawchive_api.all_files(detalle)
+        except Exception:
+            archivos = []
+        self._pch_q.put(("preview", idx, archivos))
+
+    def _pch_crear_preview(self, idx, archivos):
+        """Hilo principal: crea la ventana flotante de preview del post."""
+        self._pch_preview_busy.discard(idx)
+        if not (0 <= idx < len(self._pch_posts)):
+            return
+        # Si el puntero ya no está sobre la tarjeta, no se abre
+        if self._pch_preview_idx != idx:
+            return
+        p = self._pch_posts[idx]
+        svc = str(p.get("service") or "")
+        cid = str(p.get("user") or "")
+        pid = str(p.get("id") or "")
+        titulo = (str(p.get("title") or "").strip() or f"post {pid}")
+        # Destruir el preview anterior si existe
+        self._pch_hide_preview_ventana()
+        self._pch_preview_idx = idx
+        win = ctk.CTkToplevel(self)
+        self._pch_preview_win = win
+        win.wm_overrideredirect(True)
+        win.attributes("-topmost", True)
+        win.configure(fg_color=COLORS["CARD_BG"])
+        frame = ctk.CTkFrame(win, fg_color=COLORS["CARD_BG"], corner_radius=8,
                              border_width=1, border_color=COLORS["BORDER"])
         frame.pack(padx=1, pady=1)
-        # Título
-        titulo = (str(p.get("title") or "").strip() or f"post {p.get('id')}")
         ctk.CTkLabel(frame, text=titulo[:80], font=("Segoe UI", 12, "bold"),
-                     text_color=COLORS["TEXT"], wraplength=300).pack(padx=12, pady=(10, 6), anchor="w")
-        # Creador + fecha
-        cid = str(p.get("user") or "")
-        svc = str(p.get("service") or "")
+                     text_color=COLORS["TEXT"], wraplength=300).pack(
+            padx=12, pady=(10, 6), anchor="w")
         creador = self._pch_nom.get((svc, cid), cid)
         fecha = str(p.get("published") or "")[:10]
         counts = pawchive_api.count_by_type_list(p)
         info = f"{creador}  •  {fecha}  •  {svc}"
         info += f"  •  🖼 {counts['imagen']}  🎬 {counts['video']}  📁 {counts['archivo']}"
-        ctk.CTkLabel(frame, text=info, font=("Segoe UI", 11), text_color=COLORS["MUTED"]).pack(padx=12, anchor="w")
-        # Separador
-        ctk.CTkFrame(frame, height=1, fg_color=COLORS["BORDER"]).pack(fill="x", padx=8, pady=6)
-        # Archivos (lista)
-        archivos = pawchive_api.all_files(pawchive_api.fetch_post(svc, cid, str(p.get("id"))))
+        ctk.CTkLabel(frame, text=info, font=("Segoe UI", 11),
+                     text_color=COLORS["MUTED"]).pack(padx=12, anchor="w")
+        ctk.CTkFrame(frame, height=1, fg_color=COLORS["BORDER"]).pack(
+            fill="x", padx=8, pady=6)
         if archivos:
-            for a in archivos[:12]:  # máx 12
-                icon = {"imagen": "🖼", "video": "🎬", "archivo": "📁"}.get(a["tipo"], "📄")
+            for a in archivos[:12]:      # máx 12
+                icon = {"imagen": "🖼", "video": "🎬",
+                        "archivo": "📁"}.get(a["tipo"], "📄")
                 name = a["nombre"][:50]
                 ctk.CTkLabel(frame, text=f"{icon}  {name}", font=("Segoe UI", 11),
-                             text_color=COLORS["TEXT"], anchor="w").pack(padx=12, pady=1, anchor="w", fill="x")
+                             text_color=COLORS["TEXT"], anchor="w").pack(
+                    padx=12, pady=1, anchor="w", fill="x")
             if len(archivos) > 12:
                 ctk.CTkLabel(frame, text=f"... y {len(archivos) - 12} más",
-                             font=("Segoe UI", 10), text_color=COLORS["MUTED"]).pack(padx=12, pady=2, anchor="w")
+                             font=("Segoe UI", 10),
+                             text_color=COLORS["MUTED"]).pack(
+                    padx=12, pady=2, anchor="w")
         else:
-            ctk.CTkLabel(frame, text="(sin archivos accesibles)", font=("Segoe UI", 11),
-                         text_color=COLORS["MUTED"]).pack(padx=12, pady=4, anchor="w")
-        ctk.CTkFrame(frame, height=1, fg_color=COLORS["BORDER"]).pack(fill="x", padx=8, pady=6)
-        # Botón abrir en web
-        ctk.CTkButton(frame, text=" Abrir en pawchive", height=28, font=("Segoe UI", 11),
-                      fg_color="#3a3a3a", hover_color="#4a4a4a",
-                      command=lambda: webbrowser.open(pawchive_api.post_url(svc, cid, str(p.get("id"))))).pack(padx=12, pady=(0, 10))
-        # Posicionar a la derecha de la fila (Treeview item)
-        self._pch_preview_win.update_idletasks()
-        iid = str(idx)
-        bbox = self.pch_tree.bbox(iid)
-        if bbox:
-            # bbox = (x, y, width, height) relativo al Treeview
-            row_x, row_y, row_w, row_h = bbox
-            # Coordenadas del Treeview en pantalla
-            tree_x = self.pch_tree.winfo_rootx()
-            tree_y = self.pch_tree.winfo_rooty()
-            # Posicionar a la derecha de la fila con un pequeño gap
-            x = tree_x + row_x + row_w + 10
-            y = tree_y + row_y
+            ctk.CTkLabel(frame, text="(sin archivos accesibles)",
+                         font=("Segoe UI", 11),
+                         text_color=COLORS["MUTED"]).pack(
+                padx=12, pady=4, anchor="w")
+        ctk.CTkFrame(frame, height=1, fg_color=COLORS["BORDER"]).pack(
+            fill="x", padx=8, pady=6)
+        ctk.CTkButton(frame, text=" Abrir en pawchive", height=28,
+                      font=("Segoe UI", 11), fg_color="#3a3a3a",
+                      hover_color="#4a4a4a",
+                      command=lambda: webbrowser.open(
+                          pawchive_api.post_url(svc, cid, pid))).pack(
+            padx=12, pady=(0, 10))
+        # Posicionar a la derecha de la tarjeta
+        win.update_idletasks()
+        card = self.pch_post_cards.get(idx)
+        if card is not None:
+            try:
+                x = card["frame"].winfo_rootx() + card["frame"].winfo_width() + 10
+                y = card["frame"].winfo_rooty()
+            except Exception:
+                x = self.winfo_pointerx() + 20
+                y = self.winfo_pointery() + 10
         else:
-            # Fallback: cerca del cursor
             x = self.winfo_pointerx() + 20
             y = self.winfo_pointery() + 10
-        # Ajustar si se sale de pantalla por la derecha
-        self._pch_preview_win.update_idletasks()
-        pw, ph = self._pch_preview_win.winfo_width(), self._pch_preview_win.winfo_height()
+        pw, ph = win.winfo_width(), win.winfo_height()
         sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
         if x + pw > sw:
-            # Si no cabe a la derecha, poner a la izquierda de la fila
-            if bbox:
-                x = tree_x + row_x - pw - 10
-            else:
-                x = sw - pw - 10
+            x = max(0, sw - pw - 10)
         if y + ph > sh:
-            y = sh - ph - 10
-        self._pch_preview_win.geometry(f"+{x}+{y}")
+            y = max(0, sh - ph - 10)
+        win.geometry(f"+{x}+{y}")
+
+    def _pch_hide_preview_ventana(self):
+        """Destruye solo la ventana de preview (sin tocar los timers)."""
+        if self._pch_preview_win and self._pch_preview_win.winfo_exists():
+            try:
+                self._pch_preview_win.destroy()
+            except Exception:
+                pass
+        self._pch_preview_win = None
 
     def _pch_hide_preview(self, event=None):
         """Oculta el panel de preview."""
         if self._pch_preview_after:
-            self.after_cancel(self._pch_preview_after)
+            try:
+                self.after_cancel(self._pch_preview_after)
+            except Exception:
+                pass
             self._pch_preview_after = None
-        if self._pch_preview_win and self._pch_preview_win.winfo_exists():
-            self._pch_preview_win.destroy()
-        self._pch_preview_win = None
+        self._pch_hide_preview_ventana()
         self._pch_preview_idx = None
 
     def _pch_todo_posts(self):
-        hijos = self.pch_tree.get_children()
-        if hijos:
-            self.pch_tree.selection_set(hijos)
-            self._pch_sel_posts()       # por si el evento no llega
+        """Selecciona todos los posts de la página actual."""
+        for idx, card in self.pch_post_cards.items():
+            if not (0 <= idx < len(self._pch_posts)):
+                continue
+            self._pch_acum[card["pid"]] = self._pch_posts[idx]
+        self._pch_sel_posts()
 
     def _pch_limpiar_posts(self):
         self.pch_entry_posts.delete(0, "end")
-        self.pch_tree.delete(*self.pch_tree.get_children())
+        frame = getattr(self, "pch_posts_frame", None)
+        if frame is not None and frame.winfo_exists():
+            for widget in frame.winfo_children():
+                widget.destroy()
+        self.pch_post_cards.clear()
         self._pch_posts = []
         self._pch_page = 0
+        self._pch_post_pag = 0
+        self._pch_post_pags = 1
         self._pch_acum.clear()          # la selección acumulada también
-        self.lbl_pch_pag.configure(text="Página 0")
-        self.btn_pch_prev.configure(state="disabled")
-        self.btn_pch_next.configure(state="disabled")
+        self.lbl_pch_post_pag.configure(text="Página 1 de 1")
+        self.btn_pch_post_prev.configure(state="disabled")
+        self.btn_pch_post_next.configure(state="disabled")
         self.lbl_pch_posts.configure(text="—", text_color=COLORS["MUTED"])
         self._pch_sel_posts()
 

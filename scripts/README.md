@@ -293,8 +293,14 @@ Pestaña con **dos paneles**; todo va por la API JSON de `pawchive_api.py`
 - **🔍 Buscador de posts (derecha)**
   - `GET /api/v1/posts?q=…&service=…&o=…` con **búsqueda real** (si la
     consulta está vacía lista los posts recientes), filtro de servicio y
-    **paginación de 50 en 50** (◀ Anterior / Siguiente ▶, la última página
-    deshabilita Siguiente).
+    **paginación de 50 en 50** en el servidor.
+  - Los posts se muestran **como tarjetas** (igual que los artistas): grid
+    de **3×3 = 9 tarjetas por página** con la **portada** del post, el
+    **título**, el **creador · fecha** y la línea **servicio · 🖼 n 🎬 n 📁 n**.
+    La barra inferior tiene **‹ Anterior**, **Página X de Y**, **Siguiente ›**
+    y un campo para saltar a una página (y Enter). La API devuelve bloques
+    de 50 posts (6 páginas de tarjetas): al llegar al final de un bloque se
+    pide el siguiente a la API y la numeración de página continúa.
   - **Modo creador**: al hacer clic en un artista el cabecero pasa a
     **🎨 Posts de {nombre}** con un botón **← Volver**, el desplegable de
     servicio se deshabilita (lo fija el creador) y la entrada busca
@@ -302,12 +308,19 @@ Pestaña con **dos paneles**; todo va por la API JSON de `pawchive_api.py`
     (la `q` la resuelve el servidor, con la misma paginación de 50 en 50).
     ← Volver restaura la búsqueda global anterior. Mientras carga, botón
     🔍 deshabilitado y aviso *«⏳ Cargando posts de X…»*.
-  - Tabla **Título / Creador / Fecha / Servicio / Img** con selección
-    múltiple **acumulada entre páginas** (fuente de verdad: lo marcado no
-    se pierde al cambiar de página ni de búsqueda, y el contador muestra el
-    total; al volver a una página se re-marcan sus posts), **⬜ Todo** /
-    **✖ Limpiar** (esta vacía también la acumulación), **doble clic** para
-    abrir el post en el navegador y contador de selección.
+  - **Selección múltiple acumulada entre páginas** (fuente de verdad: lo
+    marcado no se pierde al cambiar de página ni de búsqueda, y el contador
+    muestra el total; al volver a una página se re-markan sus posts),
+    **⬜ Todo** (los de la página actual) / **✖ Limpiar** (esta vacía también
+    la acumulación), **clic** para marcar/desmarcar una tarjeta, **doble
+    clic** para abrir el post en el navegador y contador de selección.
+  - **Portadas**: se descargan en un hilo aparte y se guardan en la caché
+    `scripts/pawchive_thumbs/`; la portada se **recorta al tamaño de la
+    tarjeta** (así la llena sin deformarse). Si una imagen falla, la tarjeta
+    muestra la inicial del título y el error queda en el registro.
+  - **Preview al pasar el ratón**: una ventana flotante con el detalle del
+    post y la lista de archivos. El detalle se pide **en un hilo** (no
+    bloquea la interfaz) y la ventana se pinta en el hilo principal.
   - **➕ Importar seleccionados a la BD**: tras confirmar, un hilo de fondo
     inserta **toda la acumulación** con título **`Creador — Título`**
     (sufijo ` #id_post` si el título choca), la URL única, sus **páginas**
@@ -338,6 +351,8 @@ instante y la interfaz no se quede quieta:
   aparte**; la GUI solo consume la lista ya en memoria.
 - El **grid de artistas** está paginado: solo se crean **9 tarjetas** (3×3)
   a la vez, así que no hay 99.348 widgets que crear ni scroll infinito.
+- El **grid de posts** también: solo 9 tarjetas por página (la API sigue
+  entregando bloques de 50, pero en pantalla solo se pintan 9).
 
 Medido en este equipo con el **mainloop real** (la misma forma en que se
 mide la respuesta de la app; con un `update()` en bucle los números salen
